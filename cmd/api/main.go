@@ -12,10 +12,12 @@ import (
 	"syscall"
 	"time"
 
+	"flowforge/internal/auth"
 	"flowforge/internal/platform/config"
 	"flowforge/internal/platform/logger"
 	"flowforge/internal/platform/postgres"
 	"flowforge/internal/platform/redis"
+	"flowforge/internal/tenant"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	redisclient "github.com/redis/go-redis/v9"
@@ -108,12 +110,23 @@ func (h *HealthChecker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // NewRouter registers HTTP routes for the API service.
-func NewRouter(hc *HealthChecker) *http.ServeMux {
+func NewRouter(hc *HealthChecker, authHandler *auth.AuthHandler, authMiddleware *auth.AuthMiddleware) *http.ServeMux {
 	mux := http.NewServeMux()
 	if hc != nil {
 		mux.Handle("/health", hc)
 		mux.Handle("/api/v1/health", hc)
 	}
+
+	if authHandler != nil {
+		mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+		mux.HandleFunc("POST /api/v1/auth/refresh", authHandler.Refresh)
+		mux.HandleFunc("POST /api/v1/auth/logout", authHandler.Logout)
+
+		if authMiddleware != nil {
+			mux.Handle("GET /api/v1/users/me", authMiddleware.Authenticate(http.HandlerFunc(authHandler.GetMe)))
+		}
+	}
+
 	return mux
 }
 
@@ -127,7 +140,7 @@ func main() {
 	var dbPool *pgxpool.Pool
 	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Warn("failed to connect to postgresql during startup", slog.Any("error", err))
+		log.Warn("failed to connect to postgresql during startup", slog.String("dbUrl", logger.RedactURL(cfg.DatabaseURL)), slog.Any("error", err))
 	} else {
 		dbPool = pool
 		defer dbPool.Close()
@@ -136,7 +149,7 @@ func main() {
 	var rClient *redisclient.Client
 	rConn, err := redis.NewClient(ctx, cfg.RedisURL)
 	if err != nil {
-		log.Warn("failed to connect to redis during startup", slog.Any("error", err))
+		log.Warn("failed to connect to redis during startup", slog.String("redisUrl", logger.RedactURL(cfg.RedisURL)), slog.Any("error", err))
 	} else {
 		rClient = rConn
 		defer rClient.Close()
@@ -150,7 +163,40 @@ func main() {
 		hc.Redis = &RedisPingerAdapter{client: rClient}
 	}
 
-	router := NewRouter(hc)
+	var authHandler *auth.AuthHandler
+	var authMiddleware *auth.AuthMiddleware
+
+	if dbPool != nil {
+		tenantRepo := tenant.NewTenantRepository(dbPool)
+		userRepo := auth.NewUserRepository(dbPool)
+		jwtSecret := os.Getenv("JWT_SECRET")
+		if jwtSecret == "" {
+			if cfg.Environment == "production" || cfg.Environment == "staging" {
+				log.Error("JWT_SECRET environment variable must be set in production/staging")
+				os.Exit(1)
+			}
+			jwtSecret = "flowforge-dev-secret-change-in-prod-12345"
+		}
+		if len(jwtSecret) < 32 && (cfg.Environment == "production" || cfg.Environment == "staging") {
+			log.Error("JWT_SECRET must be at least 32 characters long in production/staging")
+			os.Exit(1)
+		}
+
+		var blacklist auth.TokenBlacklist
+		if rClient != nil {
+			blacklist = auth.NewRedisTokenBlacklist(rClient)
+		} else {
+			blacklist = auth.NewNoopTokenBlacklist()
+		}
+
+		jwtSvc := auth.NewJWTService(jwtSecret, 15*time.Minute, 7*24*time.Hour)
+		passSvc := auth.NewPasswordService()
+
+		authHandler = auth.NewAuthHandlerWithBlacklist(tenantRepo, userRepo, jwtSvc, passSvc, blacklist)
+		authMiddleware = auth.NewAuthMiddlewareWithBlacklist(jwtSvc, blacklist)
+	}
+
+	router := NewRouter(hc, authHandler, authMiddleware)
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
 		Handler:      router,

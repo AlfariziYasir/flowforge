@@ -116,7 +116,7 @@ func TestHealthHandler(t *testing.T) {
 				DB:    tt.db,
 				Redis: tt.redis,
 			}
-			router := NewRouter(hc)
+			router := NewRouter(hc, nil, nil)
 
 			req := httptest.NewRequest(http.MethodGet, "/health", nil)
 			rec := httptest.NewRecorder()

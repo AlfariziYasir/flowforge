@@ -19,7 +19,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	log.Info("Starting FlowForge Worker service", slog.String("env", cfg.Environment), slog.String("redisUrl", cfg.RedisURL))
+	log.Info("Starting FlowForge Worker service", slog.String("env", cfg.Environment), slog.String("redisUrl", logger.RedactURL(cfg.RedisURL)))
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

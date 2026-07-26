@@ -53,8 +53,6 @@
 - Evaluated changes along Spec alignment and Standards axes.
 - Generated issue list report saved to [.agents/plans/code_review_audit_report.md](file:///home/mohyasiralfarizi/Golang/flowforge/.agents/plans/code_review_audit_report.md).
 
-
-
 ### [2026-07-25] Phase 1 Infrastructure Audit & Remediation Execution
 - Audited Phase 1 configuration (`docker-compose.yml`, `Dockerfile.api`, `Dockerfile.worker`, `cmd/api/main.go`).
 - Fixed `docker-compose.yml` seed data race condition: removed `/docker-entrypoint-initdb.d/99_seed.sql` mount from `postgres` and created `seed` service running after `migrate` completes cleanly.
@@ -63,17 +61,33 @@
 - Refactored `internal/platform/postgres/unit_of_work.go` to use `context.WithoutCancel(ctx)` for transaction rollback, preventing failed rollbacks when client contexts are cancelled.
 - Verified all unit test suites (`go test ./...`) pass cleanly.
 
+### [2026-07-26] Phase 2 Planning & Grilling Session — Identity, Authentication, and Tenant Safety
+- Read all reference docs in `.agents/docs/`, `.agents/plans/`, `.agents/memory/`, `.agents/AGENTS.md`, and `CONTEXT.md`.
+- Initiated `/grill-me` design interview session to resolve architectural dependencies for Phase 2.
+- Confirmed Token Strategy: Single Access Token + Refresh Token signed via HMAC-SHA256 (`golang-jwt/jwt/v5`) using `JWT_SECRET`.
+- Confirmed Password Hashing & Context: `bcrypt` (cost 12) via `golang.org/x/crypto/bcrypt` and `AuthUser` context struct in `context.Context`.
+- Confirmed RBAC Strategy: HTTP Middleware `RequireRole(allowedRoles ...string)` returning `403 Forbidden` on role mismatch.
+- Confirmed API Scope: `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/users/me`.
+- Created `implementation_plan.md` artifact and extracted copy to `.agents/plans/phase_2_identity_authentication_and_tenant_safety.md` per project rule, incorporating explicit 6-slice TDD Red-Green-Refactor execution roadmap and enterprise architectural recommendations for future user usecase improvements.
 
+### [2026-07-26] Phase 2 TDD Execution — Identity, Authentication, and Tenant Safety
+- **Slice 1 (Password Service)**: Created `internal/auth/password_test.go` and `internal/auth/password.go` implementing `PasswordService` with `bcrypt` (cost 12), `HashPassword`, and `ComparePassword`. Verified via Red-Green loop.
+- **Slice 2 (JWT Service)**: Added `github.com/golang-jwt/jwt/v5`. Created `internal/auth/jwt_test.go` and `internal/auth/jwt.go` implementing `JWTService` with HMAC-SHA256 token pair generation (`GenerateTokenPair`) and validation (`ValidateAccessToken`, `ValidateRefreshToken`) for `sub`, `tenantId`, `email`, `role`, and `type`.
+- **Slice 3 (Context Helpers)**: Created `internal/auth/context_test.go` and `internal/auth/context.go` implementing type-safe `AuthUser` context helpers (`ContextWithAuthUser`, `AuthUserFromContext`, `TenantIDFromContext`).
+- **Slice 4 (Auth & RBAC Middleware)**: Created `internal/auth/middleware_test.go` and `internal/auth/middleware.go` implementing `AuthMiddleware.Authenticate` (Bearer token validation & context injection) and `RequireRole(roles...)` returning `401 Unauthorized` / `403 Forbidden`.
+- **Slice 5 (Domain & Repositories)**: Defined domain models `internal/domain/tenant.go` and `internal/domain/user.go`. Implemented `UserRepository` (`FindByEmail`, `FindByID`) in `internal/auth/repository.go` and `TenantRepository` (`FindBySlug`, `FindByID`) in `internal/tenant/repository.go` backed by `postgres.BaseRepository[T]`.
+- **Slice 6 (HTTP Handlers & Wiring)**: Created `internal/auth/handler_test.go` and `internal/auth/handler.go` implementing `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, and `GET /api/v1/users/me`. Wired up routes and middleware in `cmd/api/main.go` and `NewRouter`.
+- Verified all unit tests (`go test -v -race ./...`) pass cleanly with 0 data races.
 
+### [2026-07-26] Phase 2 Code Review Audit & Remediation Execution
+- **Component 1 (JWT Claims & Secret Guard)**: Added `JTI` claim to `CustomClaims` and `RegisteredClaims.ID` in `internal/auth/jwt.go`. Added startup validation in `cmd/api/main.go` rejecting secrets < 32 chars in production/staging.
+- **Component 2 (Redis Token Revocation)**: Created `TokenBlacklist` interface, `redisTokenBlacklist` adapter (`token:revoked:<jti>` Redis key prefix), and `noopTokenBlacklist` in `internal/auth/token_blacklist.go` with unit tests in `token_blacklist_test.go`.
+- **Component 3 (Timing Attack Defense & Token Rotation)**: Added constant-time dummy bcrypt comparison (`dummyBcryptHash`) in `AuthHandler.Login` on missing user/tenant to equalize response times (~100ms) and block email enumeration attacks. Added JTI revocation on `Logout` and Token Rotation on `Refresh`. Integrated `TokenBlacklist` into `AuthMiddleware.Authenticate` returning `401 Unauthorized` for revoked tokens.
+- **Component 4 (Bootstrap & Wiring)**: Wired `TokenBlacklist` into `AuthHandler` and `AuthMiddleware` in `cmd/api/main.go`.
+- Verified all unit tests (`go test -v -race ./...`) pass cleanly with 0 data races.
 
-
-
-
-
-
-
-
-
-
-
-
+### [2026-07-26] PR #1 Schema & Security Remediation Execution
+- **Multi-Tenant Composite FKs**: Updated `migrations/000001_init_schema.up.sql` replacing single-column foreign keys with composite `(tenant_id, ...)` foreign keys for `workflow_versions`, `workflow_nodes`, `workflow_edges`, and `workflow_runs`. Added unique composite keys on `workflows(tenant_id, id)`, `workflow_versions(tenant_id, workflow_id, id)`, and `workflow_nodes(tenant_id, workflow_version_id, id)`.
+- **Credential Redaction Utility**: Created `RedactURL(rawURL string) string` helper in `internal/platform/logger/redact.go` and unit tests in `redact_test.go`.
+- **Log Hardening**: Applied `logger.RedactURL` in `cmd/api/main.go` and `cmd/worker/main.go` to scrub connection passwords from structured `slog` output.
+- Verified all unit tests (`go test -v -race ./...`) pass cleanly with 0 data races.

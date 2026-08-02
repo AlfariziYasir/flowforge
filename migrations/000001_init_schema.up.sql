@@ -1,5 +1,5 @@
 -- 000001_init_schema.up.sql
--- FlowForge Database Migration v1 (Multi-Tenant Composite FK Hardened)
+-- FlowForge Database Migration v1 (Multi-Tenant Composite FK Hardened across All Tables)
 
 -- 1. tenants
 CREATE TABLE IF NOT EXISTS tenants (
@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS users (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_users_tenant_email UNIQUE (tenant_id, email)
+    CONSTRAINT uq_users_tenant_email UNIQUE (tenant_id, email),
+    CONSTRAINT uq_users_tenant_id UNIQUE (tenant_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_tenant_role ON users(tenant_id, role);
@@ -53,23 +54,25 @@ CREATE TABLE IF NOT EXISTS workflow_versions (
     graph_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     checksum VARCHAR(64) NOT NULL DEFAULT '',
-    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_by UUID,
     published_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_workflow_versions_workflow_ver UNIQUE (workflow_id, version_number),
     CONSTRAINT uq_workflow_versions_tenant_wf_id UNIQUE (tenant_id, workflow_id, id),
     CONSTRAINT uq_workflow_versions_tenant_version_id UNIQUE (tenant_id, id),
-    CONSTRAINT fk_workflow_versions_tenant_workflow FOREIGN KEY (tenant_id, workflow_id) REFERENCES workflows(tenant_id, id) ON DELETE CASCADE
+    CONSTRAINT fk_workflow_versions_tenant_workflow FOREIGN KEY (tenant_id, workflow_id) REFERENCES workflows(tenant_id, id) ON DELETE CASCADE,
+    -- Note: ON DELETE SET NULL (created_by) requires PostgreSQL 15+ to avoid nulling tenant_id
+    CONSTRAINT fk_workflow_versions_tenant_creator FOREIGN KEY (tenant_id, created_by) REFERENCES users(tenant_id, id) ON DELETE SET NULL (created_by)
 );
 
 CREATE INDEX IF NOT EXISTS idx_workflow_versions_tenant_wf_ver ON workflow_versions(tenant_id, workflow_id, version_number DESC);
 
--- Add circular foreign key for workflows.current_version_id
+-- Add circular foreign key for workflows.current_version_id (PostgreSQL 15+ required for column-scoped SET NULL)
 ALTER TABLE workflows
     ADD CONSTRAINT fk_workflows_current_version
     FOREIGN KEY (tenant_id, current_version_id)
     REFERENCES workflow_versions(tenant_id, id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL (current_version_id);
 
 -- 5. workflow_nodes
 CREATE TABLE IF NOT EXISTS workflow_nodes (
@@ -83,6 +86,7 @@ CREATE TABLE IF NOT EXISTS workflow_nodes (
     position_y INT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_workflow_nodes_version_key UNIQUE (workflow_version_id, node_key),
+    CONSTRAINT uq_workflow_nodes_tenant_id UNIQUE (tenant_id, id),
     CONSTRAINT uq_workflow_nodes_tenant_version_id UNIQUE (tenant_id, workflow_version_id, id),
     CONSTRAINT fk_workflow_nodes_tenant_version FOREIGN KEY (tenant_id, workflow_version_id) REFERENCES workflow_versions(tenant_id, id) ON DELETE CASCADE
 );
@@ -122,6 +126,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     finished_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_workflow_runs_tenant_id UNIQUE (tenant_id, id),
     CONSTRAINT fk_workflow_runs_tenant_wf_ver FOREIGN KEY (tenant_id, workflow_id, workflow_version_id) REFERENCES workflow_versions(tenant_id, workflow_id, id) ON DELETE CASCADE
 );
 
@@ -134,8 +139,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_runs_tenant_idempotency ON workflo
 CREATE TABLE IF NOT EXISTS step_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    workflow_run_id UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
-    workflow_node_id UUID NOT NULL REFERENCES workflow_nodes(id) ON DELETE CASCADE,
+    workflow_run_id UUID NOT NULL,
+    workflow_node_id UUID NOT NULL,
     node_key VARCHAR(255) NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'ready', 'running', 'succeeded', 'failed', 'retrying', 'skipped')),
     attempt_count INT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
@@ -146,7 +151,10 @@ CREATE TABLE IF NOT EXISTS step_runs (
     finished_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_step_runs_run_node UNIQUE (workflow_run_id, workflow_node_id)
+    CONSTRAINT uq_step_runs_run_node UNIQUE (workflow_run_id, workflow_node_id),
+    CONSTRAINT uq_step_runs_tenant_id UNIQUE (tenant_id, id),
+    CONSTRAINT fk_step_runs_tenant_run FOREIGN KEY (tenant_id, workflow_run_id) REFERENCES workflow_runs(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_step_runs_tenant_node FOREIGN KEY (tenant_id, workflow_node_id) REFERENCES workflow_nodes(tenant_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_step_runs_run_status ON step_runs(workflow_run_id, status);
@@ -156,12 +164,14 @@ CREATE INDEX IF NOT EXISTS idx_step_runs_tenant_run ON step_runs(tenant_id, work
 CREATE TABLE IF NOT EXISTS execution_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    workflow_run_id UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
-    step_run_id UUID REFERENCES step_runs(id) ON DELETE CASCADE,
+    workflow_run_id UUID NOT NULL,
+    step_run_id UUID,
     level VARCHAR(20) NOT NULL CHECK (level IN ('debug', 'info', 'warn', 'error')),
     message TEXT NOT NULL,
     context JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_execution_logs_tenant_run FOREIGN KEY (tenant_id, workflow_run_id) REFERENCES workflow_runs(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_execution_logs_tenant_step FOREIGN KEY (tenant_id, step_run_id) REFERENCES step_runs(tenant_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_execution_logs_run_created ON execution_logs(workflow_run_id, created_at ASC);
@@ -172,12 +182,14 @@ CREATE INDEX IF NOT EXISTS idx_execution_logs_step_created ON execution_logs(ste
 CREATE TABLE IF NOT EXISTS audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    actor_user_id UUID,
     action VARCHAR(255) NOT NULL,
     entity_type VARCHAR(255) NOT NULL,
     entity_id UUID,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Note: ON DELETE SET NULL (actor_user_id) requires PostgreSQL 15+ to avoid nulling tenant_id
+    CONSTRAINT fk_audit_logs_tenant_actor FOREIGN KEY (tenant_id, actor_user_id) REFERENCES users(tenant_id, id) ON DELETE SET NULL (actor_user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_created ON audit_logs(tenant_id, created_at DESC);
@@ -189,11 +201,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     scope VARCHAR(100) NOT NULL,
     idempotency_key VARCHAR(255) NOT NULL,
-    workflow_id UUID REFERENCES workflows(id) ON DELETE CASCADE,
-    workflow_run_id UUID REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    workflow_id UUID,
+    workflow_run_id UUID,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_idempotency_keys_tenant_scope_key UNIQUE (tenant_id, scope, idempotency_key)
+    CONSTRAINT uq_idempotency_keys_tenant_scope_key UNIQUE (tenant_id, scope, idempotency_key),
+    CONSTRAINT fk_idempotency_keys_tenant_wf FOREIGN KEY (tenant_id, workflow_id) REFERENCES workflows(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_idempotency_keys_tenant_run FOREIGN KEY (tenant_id, workflow_run_id) REFERENCES workflow_runs(tenant_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires ON idempotency_keys(expires_at);

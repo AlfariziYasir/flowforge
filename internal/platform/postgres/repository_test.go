@@ -2,12 +2,15 @@ package postgres_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"flowforge/internal/domain"
 	"flowforge/internal/platform/postgres"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -28,6 +31,24 @@ func TestBaseRepository_Unit(t *testing.T) {
 	assert.Equal(t, "users", repo.TableName())
 }
 
+func TestIsUniqueViolation(t *testing.T) {
+	t.Run("returns constraint name for pg 23505 error", func(t *testing.T) {
+		pgErr := &pgconn.PgError{
+			Code:           "23505",
+			ConstraintName: "uq_users_tenant_email",
+		}
+		constraint, ok := postgres.IsUniqueViolation(pgErr)
+		assert.True(t, ok)
+		assert.Equal(t, "uq_users_tenant_email", constraint)
+	})
+
+	t.Run("returns false for non-unique pg error", func(t *testing.T) {
+		pgErr := &pgconn.PgError{Code: "23503"}
+		_, ok := postgres.IsUniqueViolation(pgErr)
+		assert.False(t, ok)
+	})
+}
+
 func TestBaseRepository_Integration(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()
@@ -40,7 +61,7 @@ func TestBaseRepository_Integration(t *testing.T) {
 	userID := "b4b4f5d2-7f4e-4c0a-9cf3-3f8f8a2f1b11"
 
 	t.Run("FindByID success", func(t *testing.T) {
-		user, err := repo.FindByID(ctx, tenantID, userID)
+		user, err := repo.FindByFilter(ctx, map[string]interface{}{"tenant_id": tenantID, "id": userID})
 		if errorsIs(err, domain.ErrNotFound) {
 			t.Skip("seed user not found in database, skipping live row assertion")
 		}
@@ -51,7 +72,8 @@ func TestBaseRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("FindByID not found for non-existent ID", func(t *testing.T) {
-		user, err := repo.FindByID(ctx, tenantID, "00000000-0000-0000-0000-000000000000")
+		user, err := repo.FindByFilter(ctx, map[string]interface{}{"tenant_id": tenantID, "id": "00000000-0000-0000-0000-000000000000"})
+		fmt.Printf("error message: %s", err.Error())
 		assert.ErrorIs(t, err, domain.ErrNotFound)
 		assert.Nil(t, user)
 	})
@@ -67,10 +89,11 @@ func TestBaseRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("Paginate tenant isolation", func(t *testing.T) {
-		users, total, err := repo.Paginate(ctx, tenantID, postgres.PaginationParams{
+		users, total, err := repo.Paginate(ctx, postgres.PaginationParams{
 			Page:     1,
 			PageSize: 10,
 			OrderBy:  "created_at DESC",
+			Filters:  map[string]interface{}{"tenant_id": tenantID},
 		})
 		require.NoError(t, err)
 		assert.NotNil(t, users)
@@ -84,6 +107,21 @@ func TestBaseRepository_Integration(t *testing.T) {
 			assert.NotNil(t, users)
 			return nil
 		})
+		require.NoError(t, err)
+	})
+
+	t.Run("Create Success", func(t *testing.T) {
+		user := &TestUserEntity{
+			ID:           uuid.NewString(),
+			TenantID:     tenantID,
+			Email:        "[EMAIL_ADDRESS]",
+			PasswordHash: "password",
+			Role:         "user",
+			IsActive:     true,
+			CreatedAt:    time.Now(),
+			UpdatedAt:    time.Now(),
+		}
+		err := repo.Create(ctx, user)
 		require.NoError(t, err)
 	})
 }

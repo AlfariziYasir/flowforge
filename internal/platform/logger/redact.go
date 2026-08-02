@@ -16,8 +16,9 @@ func RedactURL(rawURL string) string {
 		return rawURL
 	}
 
-	if pass, hasPassword := u.User.Password(); hasPassword && pass != "" {
-		return strings.Replace(rawURL, ":"+pass+"@", ":*****@", 1)
+	if _, hasPassword := u.User.Password(); hasPassword {
+		u.User = url.UserPassword(u.User.Username(), "*****")
+		return strings.Replace(u.String(), "%2A%2A%2A%2A%2A", "*****", 1)
 	}
 
 	return rawURL

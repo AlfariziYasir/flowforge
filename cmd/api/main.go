@@ -110,7 +110,12 @@ func (h *HealthChecker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // NewRouter registers HTTP routes for the API service.
-func NewRouter(hc *HealthChecker, authHandler *auth.AuthHandler, authMiddleware *auth.AuthMiddleware) *http.ServeMux {
+func NewRouter(
+	hc *HealthChecker,
+	authHandler *auth.AuthHandler,
+	userHandler *auth.UserHandler,
+	authMiddleware *auth.AuthMiddleware,
+) *http.ServeMux {
 	mux := http.NewServeMux()
 	if hc != nil {
 		mux.Handle("/health", hc)
@@ -123,16 +128,56 @@ func NewRouter(hc *HealthChecker, authHandler *auth.AuthHandler, authMiddleware 
 		mux.HandleFunc("POST /api/v1/auth/logout", authHandler.Logout)
 
 		if authMiddleware != nil {
+			mux.Handle("POST /api/v1/auth/logout-all", authMiddleware.Authenticate(http.HandlerFunc(authHandler.LogoutAll)))
+			mux.Handle("GET /api/v1/auth/sessions", authMiddleware.Authenticate(http.HandlerFunc(authHandler.ListSessions)))
 			mux.Handle("GET /api/v1/users/me", authMiddleware.Authenticate(http.HandlerFunc(authHandler.GetMe)))
 		}
+	}
+
+	if userHandler != nil && authMiddleware != nil {
+		mux.Handle("POST /api/v1/users", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.CreateUser))))
+		mux.Handle("GET /api/v1/users", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(userHandler.ListUsers))))
+		mux.Handle("GET /api/v1/users/{userId}", authMiddleware.Authenticate(http.HandlerFunc(userHandler.GetUser)))
+		mux.Handle("PATCH /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.UpdateUser))))
+		mux.Handle("DELETE /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.DeleteUser))))
 	}
 
 	return mux
 }
 
+const devJWTSecret = "flowforge-dev-secret-change-in-prod-12345"
+
+func isProductionLike(env string) bool {
+	return env == "production" || env == "staging"
+}
+
+func applyJWTSecretDefault(cfg *config.Config) {
+	if cfg.JWTSecret == "" && !isProductionLike(cfg.Environment) {
+		cfg.JWTSecret = devJWTSecret
+	}
+}
+
+func validateJWTSecret(cfg *config.Config) error {
+	if cfg.JWTSecret == "" {
+		if isProductionLike(cfg.Environment) {
+			return errors.New("JWT_SECRET environment variable must be set in production/staging")
+		}
+	}
+	if (len(cfg.JWTSecret) < 32 || cfg.JWTSecret == devJWTSecret) && isProductionLike(cfg.Environment) {
+		return errors.New("JWT_SECRET must be set and at least 32 characters long in production/staging")
+	}
+	return nil
+}
+
 func main() {
 	cfg := config.Load()
 	log := logger.Setup(cfg.Environment, cfg.LogLevel)
+
+	applyJWTSecretDefault(cfg)
+	if err := validateJWTSecret(cfg); err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -149,6 +194,10 @@ func main() {
 	var rClient *redisclient.Client
 	rConn, err := redis.NewClient(ctx, cfg.RedisURL)
 	if err != nil {
+		if isProductionLike(cfg.Environment) {
+			log.Error("Redis connection is required in production/staging environment", slog.String("redisUrl", logger.RedactURL(cfg.RedisURL)), slog.Any("error", err))
+			os.Exit(1)
+		}
 		log.Warn("failed to connect to redis during startup", slog.String("redisUrl", logger.RedactURL(cfg.RedisURL)), slog.Any("error", err))
 	} else {
 		rClient = rConn
@@ -164,39 +213,38 @@ func main() {
 	}
 
 	var authHandler *auth.AuthHandler
+	var userHandler *auth.UserHandler
 	var authMiddleware *auth.AuthMiddleware
 
 	if dbPool != nil {
 		tenantRepo := tenant.NewTenantRepository(dbPool)
 		userRepo := auth.NewUserRepository(dbPool)
-		jwtSecret := os.Getenv("JWT_SECRET")
-		if jwtSecret == "" {
-			if cfg.Environment == "production" || cfg.Environment == "staging" {
-				log.Error("JWT_SECRET environment variable must be set in production/staging")
-				os.Exit(1)
-			}
-			jwtSecret = "flowforge-dev-secret-change-in-prod-12345"
-		}
-		if len(jwtSecret) < 32 && (cfg.Environment == "production" || cfg.Environment == "staging") {
-			log.Error("JWT_SECRET must be at least 32 characters long in production/staging")
-			os.Exit(1)
-		}
+		uow := postgres.NewUnitOfWork(dbPool)
+		jwtSecret := cfg.JWTSecret
 
 		var blacklist auth.TokenBlacklist
+		var sessionStore auth.SessionStore
 		if rClient != nil {
 			blacklist = auth.NewRedisTokenBlacklist(rClient)
+			sessionStore = auth.NewRedisSessionStoreWithTTL(rClient, cfg.JWTRefreshExpiry)
 		} else {
 			blacklist = auth.NewNoopTokenBlacklist()
+			sessionStore = auth.NewNoopSessionStore()
 		}
 
-		jwtSvc := auth.NewJWTService(jwtSecret, 15*time.Minute, 7*24*time.Hour)
+		jwtSvc := auth.NewJWTService(jwtSecret, cfg.JWTAccessExpiry, cfg.JWTRefreshExpiry)
 		passSvc := auth.NewPasswordService()
 
-		authHandler = auth.NewAuthHandlerWithBlacklist(tenantRepo, userRepo, jwtSvc, passSvc, blacklist)
-		authMiddleware = auth.NewAuthMiddlewareWithBlacklist(jwtSvc, blacklist)
+		tenantUC := tenant.NewTenantUseCase(tenantRepo)
+		authUC := auth.NewAuthUseCase(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, cfg.JWTRefreshExpiry)
+		userUC := auth.NewUserUseCaseWithTx(userRepo, passSvc, sessionStore, cfg.JWTRefreshExpiry, uow)
+
+		authHandler = auth.NewAuthHandlerWithTrustProxy(authUC, cfg.TrustProxyHeaders)
+		userHandler = auth.NewUserHandler(userUC)
+		authMiddleware = auth.NewAuthMiddlewareWithSessionStore(jwtSvc, blacklist, sessionStore)
 	}
 
-	router := NewRouter(hc, authHandler, authMiddleware)
+	router := NewRouter(hc, authHandler, userHandler, authMiddleware)
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
 		Handler:      router,

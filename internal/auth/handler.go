@@ -4,140 +4,80 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
-	"time"
-
-	"flowforge/internal/domain"
-	"flowforge/internal/tenant"
 )
 
-// Dummy hash used for constant-time comparison when user or tenant is not found (timing attack defense).
-const dummyBcryptHash = "$2a$12$e0M2/h3uA.g.0Sg3/7aG9u4nU6b3e.6V1s/8c7e.6V1s/8c7e.6V1"
-
-// LoginRequest defines payload for POST /api/v1/auth/login.
 type LoginRequest struct {
 	TenantSlug string `json:"tenantSlug"`
 	Email      string `json:"email"`
 	Password   string `json:"password"`
 }
 
-// RefreshRequest defines payload for POST /api/v1/auth/refresh.
 type RefreshRequest struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
-// AuthResponse defines response for login and token refresh.
-type AuthResponse struct {
-	AccessToken  string       `json:"accessToken"`
-	RefreshToken string       `json:"refreshToken"`
-	ExpiresIn    int64        `json:"expiresIn"`
-	User         *domain.User `json:"user"`
-}
-
-// AuthHandler handles HTTP endpoints for identity and authentication.
 type AuthHandler struct {
-	tenantRepo tenant.TenantRepository
-	userRepo   UserRepository
-	jwtService JWTService
-	passSvc    PasswordService
-	blacklist  TokenBlacklist
+	authUC     AuthUseCase
+	trustProxy bool
 }
 
-// NewAuthHandler creates a new AuthHandler instance with default noop blacklist.
-func NewAuthHandler(
-	tenantRepo tenant.TenantRepository,
-	userRepo UserRepository,
-	jwtService JWTService,
-	passSvc PasswordService,
-) *AuthHandler {
-	return NewAuthHandlerWithBlacklist(tenantRepo, userRepo, jwtService, passSvc, NewNoopTokenBlacklist())
-}
-
-// NewAuthHandlerWithBlacklist creates an AuthHandler with custom TokenBlacklist.
-func NewAuthHandlerWithBlacklist(
-	tenantRepo tenant.TenantRepository,
-	userRepo UserRepository,
-	jwtService JWTService,
-	passSvc PasswordService,
-	blacklist TokenBlacklist,
-) *AuthHandler {
-	if blacklist == nil {
-		blacklist = NewNoopTokenBlacklist()
-	}
+func NewAuthHandler(authUC AuthUseCase) *AuthHandler {
 	return &AuthHandler{
-		tenantRepo: tenantRepo,
-		userRepo:   userRepo,
-		jwtService: jwtService,
-		passSvc:    passSvc,
-		blacklist:  blacklist,
+		authUC: authUC,
 	}
 }
 
-// Login handles user authentication and returns JWT tokens.
+func NewAuthHandlerWithTrustProxy(authUC AuthUseCase, trustProxy bool) *AuthHandler {
+	return &AuthHandler{
+		authUC:     authUC,
+		trustProxy: trustProxy,
+	}
+}
+
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 	var req LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSONError(w, http.StatusBadRequest, "Bad Request", "invalid JSON body")
 		return
 	}
 
-	req.TenantSlug = strings.ToLower(strings.TrimSpace(req.TenantSlug))
-	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
-
 	if req.TenantSlug == "" || req.Email == "" || req.Password == "" {
 		respondJSONError(w, http.StatusBadRequest, "Bad Request", "tenantSlug, email, and password are required")
 		return
 	}
 
-	tnt, err := h.tenantRepo.FindBySlug(r.Context(), req.TenantSlug)
+	ipAddress := r.RemoteAddr
+	if h.trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if idx := strings.Index(xff, ","); idx != -1 {
+				ipAddress = strings.TrimSpace(xff[:idx])
+			} else {
+				ipAddress = strings.TrimSpace(xff)
+			}
+		}
+	}
+	userAgent := r.UserAgent()
+
+	res, err := h.authUC.Login(r.Context(), req.TenantSlug, req.Email, req.Password, ipAddress, userAgent)
 	if err != nil {
-		if errors.Is(err, tenant.ErrTenantNotFound) {
-			_ = h.passSvc.ComparePassword(dummyBcryptHash, req.Password)
+		if errors.Is(err, ErrUnauthorized) {
 			respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "invalid tenant, email, or password")
 			return
 		}
-		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to lookup tenant")
+		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to process login")
 		return
 	}
 
-	user, err := h.userRepo.FindByEmail(r.Context(), tnt.ID, req.Email)
-	if err != nil {
-		if errors.Is(err, ErrUserNotFound) {
-			_ = h.passSvc.ComparePassword(dummyBcryptHash, req.Password)
-			respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "invalid tenant, email, or password")
-			return
-		}
-		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to lookup user")
-		return
-	}
-
-	if !user.IsActive {
-		_ = h.passSvc.ComparePassword(dummyBcryptHash, req.Password)
-		respondJSONError(w, http.StatusForbidden, "Forbidden", "user account is inactive")
-		return
-	}
-
-	if err := h.passSvc.ComparePassword(user.PasswordHash, req.Password); err != nil {
-		respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "invalid tenant, email, or password")
-		return
-	}
-
-	pair, err := h.jwtService.GenerateTokenPair(user.ID, user.TenantID, user.Email, user.Role)
-	if err != nil {
-		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to generate authentication tokens")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, AuthResponse{
-		AccessToken:  pair.AccessToken,
-		RefreshToken: pair.RefreshToken,
-		ExpiresIn:    pair.ExpiresIn,
-		User:         user,
-	})
+	respondJSON(w, http.StatusOK, res)
 }
 
-// Refresh handles token refresh using a valid refresh token and performs token rotation.
 func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 	var req RefreshRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSONError(w, http.StatusBadRequest, "Bad Request", "invalid JSON body")
@@ -149,64 +89,34 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claims, err := h.jwtService.ValidateRefreshToken(req.RefreshToken)
+	res, err := h.authUC.Refresh(r.Context(), req.RefreshToken)
 	if err != nil {
-		respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "invalid or expired refresh token")
-		return
-	}
-
-	if claims.JTI != "" {
-		revoked, err := h.blacklist.IsRevoked(r.Context(), claims.JTI)
-		if err == nil && revoked {
-			respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "refresh token has been revoked")
+		if errors.Is(err, ErrUserInactive) {
+			respondJSONError(w, http.StatusForbidden, "Forbidden", "user account is inactive")
 			return
 		}
-	}
-
-	user, err := h.userRepo.FindByID(r.Context(), claims.TenantID, claims.UserID)
-	if err != nil {
-		if errors.Is(err, ErrUserNotFound) {
-			respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "user not found")
+		if errors.Is(err, ErrUnauthorized) {
+			respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "invalid or expired refresh token")
 			return
 		}
-		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to lookup user")
+		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to refresh token")
 		return
 	}
 
-	if !user.IsActive {
-		respondJSONError(w, http.StatusForbidden, "Forbidden", "user account is inactive")
-		return
-	}
-
-	pair, err := h.jwtService.GenerateTokenPair(user.ID, user.TenantID, user.Email, user.Role)
-	if err != nil {
-		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to generate tokens")
-		return
-	}
-
-	// Revoke old refresh token (token rotation)
-	if claims.JTI != "" {
-		_ = h.blacklist.Revoke(r.Context(), claims.JTI, 7*24*time.Hour)
-	}
-
-	respondJSON(w, http.StatusOK, AuthResponse{
-		AccessToken:  pair.AccessToken,
-		RefreshToken: pair.RefreshToken,
-		ExpiresIn:    pair.ExpiresIn,
-		User:         user,
-	})
+	respondJSON(w, http.StatusOK, res)
 }
 
-// Logout revokes the current access token / refresh token JTI.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
-	if authHeader != "" {
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-			if claims, err := h.jwtService.ValidateAccessToken(parts[1]); err == nil && claims.JTI != "" {
-				_ = h.blacklist.Revoke(r.Context(), claims.JTI, 24*time.Hour)
-			}
+	tokenStr := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+
+	if err := h.authUC.Logout(r.Context(), tokenStr); err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "invalid or missing token")
+			return
 		}
+		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to process logout")
+		return
 	}
 
 	respondJSON(w, http.StatusOK, map[string]string{
@@ -215,7 +125,58 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetMe returns the authenticated user profile from context.
+func (h *AuthHandler) LogoutAll(w http.ResponseWriter, r *http.Request) {
+	authUser, ok := AuthUserFromContext(r.Context())
+	if !ok {
+		respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "authentication required")
+		return
+	}
+
+	if err := h.authUC.LogoutAllDevices(r.Context(), authUser.TenantID, authUser.ID); err != nil {
+		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to logout all devices")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"status":  "success",
+		"message": "all devices logged out successfully",
+	})
+}
+
+func (h *AuthHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
+	authUser, ok := AuthUserFromContext(r.Context())
+	if !ok {
+		respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "authentication required")
+		return
+	}
+
+	page := 1
+	pageSize := 20
+
+	if pageStr := r.URL.Query().Get("page"); pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+	if sizeStr := r.URL.Query().Get("pageSize"); sizeStr != "" {
+		if s, err := strconv.Atoi(sizeStr); err == nil && s > 0 {
+			pageSize = s
+		}
+	}
+
+	res, err := h.authUC.ListSessions(r.Context(), authUser.TenantID, authUser.ID, page, pageSize)
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			respondJSONError(w, http.StatusUnauthorized, "Unauthorized", "authentication required")
+			return
+		}
+		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to list user sessions")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, res)
+}
+
 func (h *AuthHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := AuthUserFromContext(r.Context())
 	if !ok {
@@ -223,7 +184,17 @@ func (h *AuthHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, authUser)
+	user, err := h.authUC.GetMe(r.Context(), authUser.TenantID, authUser.ID)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			respondJSONError(w, http.StatusNotFound, "Not Found", "user account no longer exists")
+			return
+		}
+		respondJSONError(w, http.StatusInternalServerError, "Internal Error", "failed to retrieve profile")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, user)
 }
 
 func respondJSON(w http.ResponseWriter, status int, data any) {

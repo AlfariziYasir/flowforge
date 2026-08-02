@@ -28,10 +28,18 @@ type bcryptPasswordService struct {
 	cost int
 }
 
-// NewPasswordService creates a new PasswordService using bcrypt.
+// NewPasswordService creates a new PasswordService using bcrypt with default cost 12.
 func NewPasswordService() PasswordService {
+	return NewPasswordServiceWithCost(defaultBcryptCost)
+}
+
+// NewPasswordServiceWithCost creates a new PasswordService using bcrypt with custom cost (useful for fast unit testing with bcrypt.MinCost).
+func NewPasswordServiceWithCost(cost int) PasswordService {
+	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
+		cost = defaultBcryptCost
+	}
 	return &bcryptPasswordService{
-		cost: defaultBcryptCost,
+		cost: cost,
 	}
 }
 

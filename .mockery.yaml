@@ -1,0 +1,21 @@
+with-expecter: true
+packages:
+  flowforge/internal/auth:
+    config:
+      dir: "internal/auth/mocks"
+      outpkg: "mocks"
+    interfaces:
+      UserRepository:
+      AuthUseCase:
+      UserUseCase:
+      JWTService:
+      PasswordService:
+      TokenBlacklist:
+      SessionStore:
+  flowforge/internal/tenant:
+    config:
+      dir: "internal/tenant/mocks"
+      outpkg: "mocks"
+    interfaces:
+      TenantRepository:
+      TenantUseCase:

@@ -30,6 +30,13 @@ func TestRedactURL(t *testing.T) {
 		is.Equal("redis://localhost:6379/0", redacted)
 	})
 
+	t.Run("redacts URL-encoded password from Postgres DSN URL", func(t *testing.T) {
+		is := assert.New(t)
+		raw := "postgres://user:p%40ssword%21@localhost:5432/flowforge?sslmode=disable"
+		redacted := logger.RedactURL(raw)
+		is.Equal("postgres://user:*****@localhost:5432/flowforge?sslmode=disable", redacted)
+	})
+
 	t.Run("returns original string on invalid URL", func(t *testing.T) {
 		is := assert.New(t)
 		raw := "invalid-url-string"

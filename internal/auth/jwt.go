@@ -10,37 +10,57 @@ import (
 )
 
 var (
-	ErrInvalidToken     = errors.New("invalid token")
-	ErrExpiredToken     = errors.New("token has expired")
+	ErrInvalidToken      = errors.New("invalid token")
+	ErrExpiredToken      = errors.New("token has expired")
 	ErrTokenTypeMismatch = errors.New("token type mismatch")
 )
+
+func init() {
+	// Set JWT time precision to milliseconds.
+	// Coupling note: session_store.go stores user revocation timestamps in UnixMilli.
+	// Millisecond-precise iat claims prevent freshly issued tokens from being misjudged
+	// as revoked when issued in the same second as a revocation.
+	jwt.TimePrecision = time.Millisecond
+}
 
 const (
 	TokenTypeAccess  = "access"
 	TokenTypeRefresh = "refresh"
 )
 
-// TokenPair contains generated access and refresh tokens.
 type TokenPair struct {
 	AccessToken  string `json:"accessToken"`
 	RefreshToken string `json:"refreshToken"`
-	ExpiresIn    int64  `json:"expiresIn"` // Access token expiration in seconds
+	ExpiresIn    int64  `json:"expiresIn"`
 }
 
-// CustomClaims defines the JWT claims payload.
 type CustomClaims struct {
-	JTI       string    `json:"jti,omitempty"`
-	UserID    uuid.UUID `json:"sub"`
 	TenantID  uuid.UUID `json:"tenantId"`
 	Email     string    `json:"email,omitempty"`
 	Role      string    `json:"role,omitempty"`
 	TokenType string    `json:"type"`
+	SessionID uuid.UUID `json:"sid,omitempty"`
 	jwt.RegisteredClaims
 }
 
-// JWTService handles token generation and validation.
+func (c *CustomClaims) UserID() uuid.UUID {
+	id, err := uuid.Parse(c.Subject)
+	if err != nil {
+		return uuid.Nil
+	}
+	return id
+}
+
+func (c *CustomClaims) GetSessionID() uuid.UUID {
+	return c.SessionID
+}
+
+func (c *CustomClaims) JTI() string {
+	return c.ID
+}
+
 type JWTService interface {
-	GenerateTokenPair(userID, tenantID uuid.UUID, email, role string) (*TokenPair, error)
+	GenerateTokenPair(userID, tenantID, sessionID uuid.UUID, email, role string) (*TokenPair, error)
 	ValidateAccessToken(tokenStr string) (*CustomClaims, error)
 	ValidateRefreshToken(tokenStr string) (*CustomClaims, error)
 }
@@ -51,7 +71,6 @@ type jwtService struct {
 	refreshExpiry time.Duration
 }
 
-// NewJWTService creates a new JWTService.
 func NewJWTService(secretKey string, accessExpiry, refreshExpiry time.Duration) JWTService {
 	return &jwtService{
 		secretKey:     []byte(secretKey),
@@ -60,19 +79,17 @@ func NewJWTService(secretKey string, accessExpiry, refreshExpiry time.Duration) 
 	}
 }
 
-// GenerateTokenPair creates access and refresh tokens for a user and tenant.
-func (s *jwtService) GenerateTokenPair(userID, tenantID uuid.UUID, email, role string) (*TokenPair, error) {
+func (s *jwtService) GenerateTokenPair(userID, tenantID, sessionID uuid.UUID, email, role string) (*TokenPair, error) {
 	now := time.Now()
 
 	accessJTI := uuid.New().String()
-	// Access Token
+
 	accessClaims := CustomClaims{
-		JTI:       accessJTI,
-		UserID:    userID,
 		TenantID:  tenantID,
 		Email:     email,
 		Role:      role,
 		TokenType: TokenTypeAccess,
+		SessionID: sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        accessJTI,
 			Subject:   userID.String(),
@@ -86,12 +103,11 @@ func (s *jwtService) GenerateTokenPair(userID, tenantID uuid.UUID, email, role s
 	}
 
 	refreshJTI := uuid.New().String()
-	// Refresh Token
+
 	refreshClaims := CustomClaims{
-		JTI:       refreshJTI,
-		UserID:    userID,
 		TenantID:  tenantID,
 		TokenType: TokenTypeRefresh,
+		SessionID: sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        refreshJTI,
 			Subject:   userID.String(),
@@ -111,7 +127,6 @@ func (s *jwtService) GenerateTokenPair(userID, tenantID uuid.UUID, email, role s
 	}, nil
 }
 
-// ValidateAccessToken validates an access token string and returns parsed claims.
 func (s *jwtService) ValidateAccessToken(tokenStr string) (*CustomClaims, error) {
 	claims, err := s.parseAndValidate(tokenStr)
 	if err != nil {
@@ -125,7 +140,6 @@ func (s *jwtService) ValidateAccessToken(tokenStr string) (*CustomClaims, error)
 	return claims, nil
 }
 
-// ValidateRefreshToken validates a refresh token string and returns parsed claims.
 func (s *jwtService) ValidateRefreshToken(tokenStr string) (*CustomClaims, error) {
 	claims, err := s.parseAndValidate(tokenStr)
 	if err != nil {

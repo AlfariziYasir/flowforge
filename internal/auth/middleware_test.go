@@ -9,9 +9,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"flowforge/internal/auth"
+	authmocks "flowforge/internal/auth/mocks"
 )
 
 func TestAuthMiddleware(t *testing.T) {
@@ -70,17 +72,28 @@ func TestAuthMiddleware(t *testing.T) {
 
 		userID := uuid.New()
 		tenantID := uuid.New()
+		sessionID := uuid.New()
 		email := "user@flowforge.local"
 		role := "editor"
 
-		pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, email, role)
+		sessionStore := authmocks.NewMockSessionStore(t)
+		sessionStore.EXPECT().IsUserRevoked(mock.Anything, userID, mock.Anything).Return(false, nil)
+		sessionStore.EXPECT().GetSession(mock.Anything, tenantID, userID, sessionID).Return(&auth.UserSession{
+			SessionID: sessionID,
+			UserID:    userID,
+			TenantID:  tenantID,
+		}, nil)
+
+		mwWithStore := auth.NewAuthMiddlewareWithSessionStore(jwtSvc, nil, sessionStore)
+
+		pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, sessionID, email, role)
 		req.NoError(err)
 
 		httpReq := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
 		httpReq.Header.Set("Authorization", "Bearer "+pair.AccessToken)
 		rec := httptest.NewRecorder()
 
-		middleware.Authenticate(dummyHandler).ServeHTTP(rec, httpReq)
+		mwWithStore.Authenticate(dummyHandler).ServeHTTP(rec, httpReq)
 
 		is.Equal(http.StatusOK, rec.Code)
 		is.Contains(rec.Body.String(), email)
@@ -90,23 +103,95 @@ func TestAuthMiddleware(t *testing.T) {
 		is := assert.New(t)
 		req := require.New(t)
 
-		blacklist := newMockBlacklistStore()
+		blacklist := authmocks.NewMockTokenBlacklist(t)
 		mwWithBlacklist := auth.NewAuthMiddlewareWithBlacklist(jwtSvc, blacklist)
 
-		pair, err := jwtSvc.GenerateTokenPair(uuid.New(), uuid.New(), "user@flowforge.local", "editor")
+		pair, err := jwtSvc.GenerateTokenPair(uuid.New(), uuid.New(), uuid.New(), "user@flowforge.local", "editor")
 		req.NoError(err)
 
 		claims, err := jwtSvc.ValidateAccessToken(pair.AccessToken)
 		req.NoError(err)
 
-		err = blacklist.Revoke(context.Background(), claims.JTI, 15*time.Minute)
-		req.NoError(err)
+		blacklist.EXPECT().IsRevoked(mock.Anything, claims.JTI()).Return(true, nil)
 
 		httpReq := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
 		httpReq.Header.Set("Authorization", "Bearer "+pair.AccessToken)
 		rec := httptest.NewRecorder()
 
 		mwWithBlacklist.Authenticate(dummyHandler).ServeHTTP(rec, httpReq)
+
+		is.Equal(http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("returns 401 Unauthorized when user token is revoked by timestamp", func(t *testing.T) {
+		is := assert.New(t)
+		req := require.New(t)
+
+		sessionStore := authmocks.NewMockSessionStore(t)
+		mwWithSessionStore := auth.NewAuthMiddlewareWithSessionStore(jwtSvc, nil, sessionStore)
+
+		userID := uuid.New()
+		tenantID := uuid.New()
+		sessionID := uuid.New()
+
+		pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, sessionID, "user@flowforge.local", "editor")
+		req.NoError(err)
+
+		sessionStore.EXPECT().IsUserRevoked(mock.Anything, userID, mock.Anything).Return(true, nil)
+
+		httpReq := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		httpReq.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+		rec := httptest.NewRecorder()
+
+		mwWithSessionStore.Authenticate(dummyHandler).ServeHTTP(rec, httpReq)
+
+		is.Equal(http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("returns 401 Unauthorized when session is revoked or not found in Redis", func(t *testing.T) {
+		is := assert.New(t)
+		req := require.New(t)
+
+		sessionStore := authmocks.NewMockSessionStore(t)
+		mwWithSessionStore := auth.NewAuthMiddlewareWithSessionStore(jwtSvc, nil, sessionStore)
+
+		userID := uuid.New()
+		tenantID := uuid.New()
+		sessionID := uuid.New()
+
+		pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, sessionID, "user@flowforge.local", "editor")
+		req.NoError(err)
+
+		sessionStore.EXPECT().IsUserRevoked(mock.Anything, userID, mock.Anything).Return(false, nil)
+		sessionStore.EXPECT().GetSession(mock.Anything, tenantID, userID, sessionID).Return(nil, auth.ErrSessionNotFound)
+
+		httpReq := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		httpReq.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+		rec := httptest.NewRecorder()
+
+		mwWithSessionStore.Authenticate(dummyHandler).ServeHTTP(rec, httpReq)
+
+		is.Equal(http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("returns 401 Unauthorized without panic when token lacks IssuedAt claim", func(t *testing.T) {
+		is := assert.New(t)
+
+		mockJwtSvc := authmocks.NewMockJWTService(t)
+		claimsWithoutIat := &auth.CustomClaims{
+			TenantID:  uuid.New(),
+			TokenType: auth.TokenTypeAccess,
+			SessionID: uuid.New(),
+		}
+		mockJwtSvc.EXPECT().ValidateAccessToken("token-without-iat").Return(claimsWithoutIat, nil)
+
+		mw := auth.NewAuthMiddleware(mockJwtSvc)
+
+		httpReq := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		httpReq.Header.Set("Authorization", "Bearer token-without-iat")
+		rec := httptest.NewRecorder()
+
+		mw.Authenticate(dummyHandler).ServeHTTP(rec, httpReq)
 
 		is.Equal(http.StatusUnauthorized, rec.Code)
 	})

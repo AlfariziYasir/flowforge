@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 
@@ -11,21 +12,29 @@ import (
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var validOrderPattern = regexp.MustCompile(`^[a-zA-Z0-9_.]+(\s+(?i:asc|desc))?$`)
 
-// StatementBuilder is the pre-configured Squirrel builder for PostgreSQL ($1, $2, etc.).
 var StatementBuilder = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
-// BaseRepository provides generic, type-safe, and tenant-isolated CRUD database operations.
+// IsUniqueViolation reports whether err is a Postgres unique-constraint
+// violation (SQLSTATE 23505), and returns the violated constraint name.
+func IsUniqueViolation(err error) (string, bool) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return pgErr.ConstraintName, true
+	}
+	return "", false
+}
+
 type BaseRepository[T any] struct {
 	pool      *pgxpool.Pool
 	tableName string
 }
 
-// NewBaseRepository instantiates a new generic BaseRepository for the target table name.
 func NewBaseRepository[T any](pool *pgxpool.Pool, tableName string) *BaseRepository[T] {
 	return &BaseRepository[T]{
 		pool:      pool,
@@ -33,22 +42,19 @@ func NewBaseRepository[T any](pool *pgxpool.Pool, tableName string) *BaseReposit
 	}
 }
 
-// TableName returns the configured table name.
 func (r *BaseRepository[T]) TableName() string {
 	return r.tableName
 }
 
-// GetDB returns active transaction from context if present, or defaults to the database pool.
 func (r *BaseRepository[T]) GetDB(ctx context.Context) DBTX {
 	return GetDBTX(ctx, r.pool)
 }
 
-// FindByID retrieves a single entity by tenant ID and record primary key ID.
-func (r *BaseRepository[T]) FindByID(ctx context.Context, tenantID string, id string) (*T, error) {
+func (r *BaseRepository[T]) FindByFilter(ctx context.Context, filters map[string]interface{}) (*T, error) {
 	query, args, err := StatementBuilder.
 		Select("*").
 		From(r.tableName).
-		Where(sq.Eq{"tenant_id": tenantID, "id": id}).
+		Where(sq.Eq(filters)).
 		Limit(1).
 		ToSql()
 	if err != nil {
@@ -72,7 +78,6 @@ func (r *BaseRepository[T]) FindByID(ctx context.Context, tenantID string, id st
 	return item, nil
 }
 
-// FindAll retrieves all entities belonging to the specified tenant ID.
 func (r *BaseRepository[T]) FindAll(ctx context.Context, tenantID string) ([]*T, error) {
 	query, args, err := StatementBuilder.
 		Select("*").
@@ -101,15 +106,14 @@ func (r *BaseRepository[T]) FindAll(ctx context.Context, tenantID string) ([]*T,
 	return items, nil
 }
 
-// PaginationParams encapsulates pagination and sorting options.
 type PaginationParams struct {
 	Page     int
 	PageSize int
 	OrderBy  string
+	Filters  map[string]interface{}
 }
 
-// Paginate retrieves a page of entities for a tenant alongside the total count.
-func (r *BaseRepository[T]) Paginate(ctx context.Context, tenantID string, params PaginationParams) ([]*T, int64, error) {
+func (r *BaseRepository[T]) Paginate(ctx context.Context, params PaginationParams) ([]*T, int64, error) {
 	page := params.Page
 	if page < 1 {
 		page = 1
@@ -121,10 +125,20 @@ func (r *BaseRepository[T]) Paginate(ctx context.Context, tenantID string, param
 
 	db := r.GetDB(ctx)
 
-	countQuery, countArgs, err := StatementBuilder.
+	countBuilder := StatementBuilder.
 		Select("COUNT(*)").
-		From(r.tableName).
-		Where(sq.Eq{"tenant_id": tenantID}).
+		From(r.tableName)
+
+	itemBuilder := StatementBuilder.
+		Select("*").
+		From(r.tableName)
+
+	for k, v := range params.Filters {
+		countBuilder = countBuilder.Where(sq.Eq{k: v})
+		itemBuilder = itemBuilder.Where(sq.Eq{k: v})
+	}
+
+	countQuery, countArgs, err := countBuilder.
 		ToSql()
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to build count sql: %w", err)
@@ -137,11 +151,7 @@ func (r *BaseRepository[T]) Paginate(ctx context.Context, tenantID string, param
 
 	sanitizedOrder := sanitizeOrderBy(params.OrderBy)
 	offset := uint64((page - 1) * pageSize)
-
-	itemsQuery, itemsArgs, err := StatementBuilder.
-		Select("*").
-		From(r.tableName).
-		Where(sq.Eq{"tenant_id": tenantID}).
+	itemsQuery, itemsArgs, err := itemBuilder.
 		OrderBy(sanitizedOrder).
 		Limit(uint64(pageSize)).
 		Offset(offset).
@@ -167,7 +177,74 @@ func (r *BaseRepository[T]) Paginate(ctx context.Context, tenantID string, param
 	return items, total, nil
 }
 
-// DeleteByPK deletes a record by tenant ID and primary key ID.
+func (r *BaseRepository[T]) Create(ctx context.Context, entity *T) error {
+	if entity == nil {
+		return errors.New("cannot create nil entity")
+	}
+
+	setMap, err := structToMap(entity)
+	if err != nil {
+		return fmt.Errorf("failed to map %s entity fields: %w", r.tableName, err)
+	}
+
+	query, args, err := StatementBuilder.
+		Insert(r.tableName).
+		SetMap(setMap).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("failed to build create sql: %w", err)
+	}
+
+	db := r.GetDB(ctx)
+	_, err = db.Exec(ctx, query, args...)
+	if err != nil {
+		if constraint, ok := IsUniqueViolation(err); ok {
+			return fmt.Errorf("%w: constraint %s violated", domain.ErrConflict, constraint)
+		}
+		return fmt.Errorf("failed to create %s record: %w", r.tableName, err)
+	}
+
+	return nil
+}
+
+func (r *BaseRepository[T]) Update(ctx context.Context, tenantID, id string, entity *T) error {
+	if entity == nil {
+		return errors.New("cannot update nil entity")
+	}
+
+	setMap, err := structToMap(entity)
+	if err != nil {
+		return fmt.Errorf("failed to map %s entity fields: %w", r.tableName, err)
+	}
+
+	delete(setMap, "tenant_id")
+	delete(setMap, "id")
+
+	query, args, err := StatementBuilder.
+		Update(r.tableName).
+		SetMap(setMap).
+		Where(sq.Eq{"tenant_id": tenantID, "id": id}).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("failed to build update sql: %w", err)
+	}
+
+	db := r.GetDB(ctx)
+	tag, err := db.Exec(ctx, query, args...)
+	if err != nil {
+		if constraint, ok := IsUniqueViolation(err); ok {
+			return fmt.Errorf("%w: constraint %s violated", domain.ErrConflict, constraint)
+		}
+		return fmt.Errorf("failed to update %s record: %w", r.tableName, err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
 func (r *BaseRepository[T]) DeleteByPK(ctx context.Context, tenantID string, id string) error {
 	query, args, err := StatementBuilder.
 		Delete(r.tableName).
@@ -196,4 +273,51 @@ func sanitizeOrderBy(orderBy string) string {
 		return "created_at DESC"
 	}
 	return trimmed
+}
+
+func structToMap(obj any) (map[string]any, error) {
+	val := reflect.ValueOf(obj)
+
+	if val.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			return nil, errors.New("object is nil")
+		}
+
+		val = val.Elem()
+	}
+
+	if val.Kind() != reflect.Struct {
+		return nil, errors.New("expected a struct or pointer struct")
+	}
+
+	typ := val.Type()
+	setMap := make(map[string]any, typ.NumField())
+
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+
+		if !field.IsExported() {
+			continue
+		}
+
+		dbTag := field.Tag.Get("db")
+		if dbTag == "-" {
+			continue
+		}
+
+		if dbTag == "" {
+			jsonTag := field.Tag.Get("json")
+			if jsonTag != "" && jsonTag != "-" {
+				dbTag = strings.Split(jsonTag, ",")[0]
+			}
+		}
+
+		if dbTag == "" || dbTag == "-" {
+			continue
+		}
+
+		setMap[dbTag] = val.Field(i).Interface()
+	}
+
+	return setMap, nil
 }

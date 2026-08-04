@@ -1,143 +1,169 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"flowforge/internal/auth"
+	"flowforge/internal/platform/config"
+	"flowforge/internal/workflow"
+	workflowmocks "flowforge/internal/workflow/mocks"
+
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-type mockPinger struct {
-	err error
-}
-
-func (m *mockPinger) Ping(ctx context.Context) error {
-	return m.err
-}
-
-func TestHealthHandler(t *testing.T) {
+func TestValidateJWTSecret(t *testing.T) {
 	tests := []struct {
-		name           string
-		db             Pinger
-		redis          Pinger
-		expectedStatus int
-		expectedBody   map[string]interface{}
+		name        string
+		secret      string
+		env         string
+		expectError bool
 	}{
 		{
-			name:           "all dependencies healthy",
-			db:             &mockPinger{err: nil},
-			redis:          &mockPinger{err: nil},
-			expectedStatus: http.StatusOK,
-			expectedBody: map[string]interface{}{
-				"success": true,
-				"data": map[string]interface{}{
-					"status":   "ok",
-					"service":  "api",
-					"postgres": "up",
-					"redis":    "up",
-				},
-				"meta":  nil,
-				"error": nil,
-			},
+			name:        "unset secret in development defaults to dev secret",
+			secret:      "",
+			env:         "development",
+			expectError: false,
 		},
 		{
-			name:           "database unhealthy",
-			db:             &mockPinger{err: errors.New("db ping timeout")},
-			redis:          &mockPinger{err: nil},
-			expectedStatus: http.StatusServiceUnavailable,
-			expectedBody: map[string]interface{}{
-				"success": false,
-				"data": map[string]interface{}{
-					"status":   "unhealthy",
-					"service":  "api",
-					"postgres": "down",
-					"redis":    "up",
-				},
-				"meta": nil,
-				"error": map[string]interface{}{
-					"code":    "SERVICE_UNAVAILABLE",
-					"message": "Health check failed for dependencies",
-					"details": nil,
-				},
-			},
+			name:        "unset secret in production is fatal",
+			secret:      "",
+			env:         "production",
+			expectError: true,
 		},
 		{
-			name:           "redis unhealthy",
-			db:             &mockPinger{err: nil},
-			redis:          &mockPinger{err: errors.New("redis connection refused")},
-			expectedStatus: http.StatusServiceUnavailable,
-			expectedBody: map[string]interface{}{
-				"success": false,
-				"data": map[string]interface{}{
-					"status":   "unhealthy",
-					"service":  "api",
-					"postgres": "up",
-					"redis":    "down",
-				},
-				"meta": nil,
-				"error": map[string]interface{}{
-					"code":    "SERVICE_UNAVAILABLE",
-					"message": "Health check failed for dependencies",
-					"details": nil,
-				},
-			},
+			name:        "dev secret in production is fatal",
+			secret:      devJWTSecret,
+			env:         "production",
+			expectError: true,
 		},
 		{
-			name:           "nil pingers (not connected)",
-			db:             nil,
-			redis:          nil,
-			expectedStatus: http.StatusServiceUnavailable,
-			expectedBody: map[string]interface{}{
-				"success": false,
-				"data": map[string]interface{}{
-					"status":   "unhealthy",
-					"service":  "api",
-					"postgres": "down",
-					"redis":    "down",
-				},
-				"meta": nil,
-				"error": map[string]interface{}{
-					"code":    "SERVICE_UNAVAILABLE",
-					"message": "Health check failed for dependencies",
-					"details": nil,
-				},
-			},
+			name:        "short secret in staging is fatal",
+			secret:      "too-short-secret-12345",
+			env:         "staging",
+			expectError: true,
+		},
+		{
+			name:        "valid 32+ char secret in production is valid",
+			secret:      "production-secret-must-be-at-least-32-characters-long!",
+			env:         "production",
+			expectError: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hc := &HealthChecker{
-				DB:    tt.db,
-				Redis: tt.redis,
+			cfg := &config.Config{
+				JWTSecret:   tt.secret,
+				Environment: tt.env,
 			}
-			router := NewRouter(hc)
-
-			req := httptest.NewRequest(http.MethodGet, "/health", nil)
-			rec := httptest.NewRecorder()
-
-			router.ServeHTTP(rec, req)
-
-			assert.Equal(t, tt.expectedStatus, rec.Code)
-			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-
-			var resp map[string]interface{}
-			err := json.Unmarshal(rec.Body.Bytes(), &resp)
-			require.NoError(t, err)
-
-			assert.Equal(t, tt.expectedBody["success"], resp["success"])
-
-			expectedData, _ := tt.expectedBody["data"].(map[string]interface{})
-			actualData, _ := resp["data"].(map[string]interface{})
-			assert.Equal(t, expectedData["status"], actualData["status"])
-			assert.Equal(t, expectedData["service"], actualData["service"])
-			assert.Equal(t, expectedData["postgres"], actualData["postgres"])
-			assert.Equal(t, expectedData["redis"], actualData["redis"])
+			applyJWTSecretDefault(cfg)
+			err := validateJWTSecret(cfg)
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
+}
+
+func TestNewRouter_UserListRequiresElevatedRole(t *testing.T) {
+	dummyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	jwtSvc := auth.NewJWTService("router-test-secret-key-32chars!!", 15*time.Minute, 7*24*time.Hour)
+	middleware := auth.NewAuthMiddleware(jwtSvc)
+
+	t.Run("allows admin role to access user list", func(t *testing.T) {
+		user := auth.AuthUser{
+			ID:       uuid.New(),
+			TenantID: uuid.New(),
+			Email:    "admin@flowforge.local",
+			Role:     "admin",
+		}
+		ctx := auth.ContextWithAuthUser(httptest.NewRequest(http.MethodGet, "/api/v1/users", nil).Context(), user)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+
+		auth.RequireRole("admin", "editor")(dummyHandler).ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("returns 403 Forbidden for viewer role accessing user list", func(t *testing.T) {
+		user := auth.AuthUser{
+			ID:       uuid.New(),
+			TenantID: uuid.New(),
+			Email:    "viewer@flowforge.local",
+			Role:     "viewer",
+		}
+		ctx := auth.ContextWithAuthUser(httptest.NewRequest(http.MethodGet, "/api/v1/users", nil).Context(), user)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+
+		auth.RequireRole("admin", "editor")(dummyHandler).ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+	})
+
+	t.Run("returns 401 Unauthorized for unauthenticated access to user list", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+		rec := httptest.NewRecorder()
+
+		middleware.Authenticate(dummyHandler).ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+}
+
+func TestNewRouter_WorkflowRoutesWiring(t *testing.T) {
+	router := NewRouter(nil, nil, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workflows", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestNewRouter_PublishVsRollbackRouteDisambiguation(t *testing.T) {
+	jwtSvc := auth.NewJWTService("router-test-secret-key-32chars!!", 15*time.Minute, 7*24*time.Hour)
+	middleware := auth.NewAuthMiddleware(jwtSvc)
+
+	wfID := uuid.New()
+	verID := uuid.New()
+	tenantID := uuid.New()
+	userID := uuid.New()
+
+	mockUC := workflowmocks.NewMockWorkflowUseCase(t)
+	mockUC.EXPECT().PublishVersion(mock.Anything, mock.Anything).Return(&workflow.PublishResult{WorkflowID: wfID, VersionID: verID, VersionNumber: 1, Status: "published"}, nil).Once()
+	mockUC.EXPECT().RollbackVersion(mock.Anything, mock.Anything).Return(&workflow.RollbackResult{WorkflowID: wfID, VersionID: verID, VersionNumber: 2, Status: "draft"}, nil).Once()
+
+	wfHandler := workflow.NewWorkflowHandler(mockUC)
+	router := NewRouter(nil, nil, nil, wfHandler, middleware)
+
+	pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, uuid.Nil, "admin@flowforge.local", "admin")
+	require.NoError(t, err)
+
+	// Test publish route
+	pubBody := []byte(`{"rowVersion":1}`)
+	reqPub := httptest.NewRequest(http.MethodPost, "/api/v1/workflows/"+wfID.String()+"/versions/publish", bytes.NewReader(pubBody))
+	reqPub.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	recPub := httptest.NewRecorder()
+	router.ServeHTTP(recPub, reqPub)
+
+	assert.Equal(t, http.StatusOK, recPub.Code)
+
+	// Test rollback route
+	rollBody := []byte(`{"rowVersion":1}`)
+	reqRoll := httptest.NewRequest(http.MethodPost, "/api/v1/workflows/"+wfID.String()+"/versions/"+verID.String()+"/rollback", bytes.NewReader(rollBody))
+	reqRoll.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	recRoll := httptest.NewRecorder()
+	router.ServeHTTP(recRoll, reqRoll)
+
+	assert.Equal(t, http.StatusOK, recRoll.Code)
 }

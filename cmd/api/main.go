@@ -12,10 +12,13 @@ import (
 	"syscall"
 	"time"
 
+	"flowforge/internal/auth"
 	"flowforge/internal/platform/config"
 	"flowforge/internal/platform/logger"
 	"flowforge/internal/platform/postgres"
 	"flowforge/internal/platform/redis"
+	"flowforge/internal/tenant"
+	"flowforge/internal/workflow"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	redisclient "github.com/redis/go-redis/v9"
@@ -108,18 +111,88 @@ func (h *HealthChecker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // NewRouter registers HTTP routes for the API service.
-func NewRouter(hc *HealthChecker) *http.ServeMux {
+func NewRouter(
+	hc *HealthChecker,
+	authHandler *auth.AuthHandler,
+	userHandler *auth.UserHandler,
+	workflowHandler *workflow.WorkflowHandler,
+	authMiddleware *auth.AuthMiddleware,
+) *http.ServeMux {
 	mux := http.NewServeMux()
 	if hc != nil {
 		mux.Handle("/health", hc)
 		mux.Handle("/api/v1/health", hc)
 	}
+
+	if authHandler != nil {
+		mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+		mux.HandleFunc("POST /api/v1/auth/refresh", authHandler.Refresh)
+		mux.HandleFunc("POST /api/v1/auth/logout", authHandler.Logout)
+
+		if authMiddleware != nil {
+			mux.Handle("POST /api/v1/auth/logout-all", authMiddleware.Authenticate(http.HandlerFunc(authHandler.LogoutAll)))
+			mux.Handle("GET /api/v1/auth/sessions", authMiddleware.Authenticate(http.HandlerFunc(authHandler.ListSessions)))
+			mux.Handle("GET /api/v1/users/me", authMiddleware.Authenticate(http.HandlerFunc(authHandler.GetMe)))
+		}
+	}
+
+	if userHandler != nil && authMiddleware != nil {
+		mux.Handle("POST /api/v1/users", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.CreateUser))))
+		mux.Handle("GET /api/v1/users", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(userHandler.ListUsers))))
+		mux.Handle("GET /api/v1/users/{userId}", authMiddleware.Authenticate(http.HandlerFunc(userHandler.GetUser)))
+		mux.Handle("PATCH /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.UpdateUser))))
+		mux.Handle("DELETE /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.DeleteUser))))
+	}
+
+	if workflowHandler != nil && authMiddleware != nil {
+		mux.Handle("POST /api/v1/workflows", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Create))))
+		mux.Handle("GET /api/v1/workflows", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.List))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.Get))))
+		mux.Handle("PATCH /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Update))))
+		mux.Handle("DELETE /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Archive))))
+		mux.Handle("PUT /api/v1/workflows/{workflowId}/draft", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.SaveDraft))))
+		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/publish", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Publish))))
+		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/{versionId}/rollback", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Rollback))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/versions", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.ListVersions))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/versions/{versionId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.GetVersion))))
+	}
+
 	return mux
+}
+
+const devJWTSecret = "flowforge-dev-secret-change-in-prod-12345"
+
+func isProductionLike(env string) bool {
+	return env == "production" || env == "staging"
+}
+
+func applyJWTSecretDefault(cfg *config.Config) {
+	if cfg.JWTSecret == "" && !isProductionLike(cfg.Environment) {
+		cfg.JWTSecret = devJWTSecret
+	}
+}
+
+func validateJWTSecret(cfg *config.Config) error {
+	if cfg.JWTSecret == "" {
+		if isProductionLike(cfg.Environment) {
+			return errors.New("JWT_SECRET environment variable must be set in production/staging")
+		}
+	}
+	if (len(cfg.JWTSecret) < 32 || cfg.JWTSecret == devJWTSecret) && isProductionLike(cfg.Environment) {
+		return errors.New("JWT_SECRET must be set and at least 32 characters long in production/staging")
+	}
+	return nil
 }
 
 func main() {
 	cfg := config.Load()
 	log := logger.Setup(cfg.Environment, cfg.LogLevel)
+
+	applyJWTSecretDefault(cfg)
+	if err := validateJWTSecret(cfg); err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -127,7 +200,7 @@ func main() {
 	var dbPool *pgxpool.Pool
 	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Warn("failed to connect to postgresql during startup", slog.Any("error", err))
+		log.Warn("failed to connect to postgresql during startup", slog.String("dbUrl", logger.RedactURL(cfg.DatabaseURL)), slog.Any("error", err))
 	} else {
 		dbPool = pool
 		defer dbPool.Close()
@@ -136,7 +209,11 @@ func main() {
 	var rClient *redisclient.Client
 	rConn, err := redis.NewClient(ctx, cfg.RedisURL)
 	if err != nil {
-		log.Warn("failed to connect to redis during startup", slog.Any("error", err))
+		if isProductionLike(cfg.Environment) {
+			log.Error("Redis connection is required in production/staging environment", slog.String("redisUrl", logger.RedactURL(cfg.RedisURL)), slog.Any("error", err))
+			os.Exit(1)
+		}
+		log.Warn("failed to connect to redis during startup", slog.String("redisUrl", logger.RedactURL(cfg.RedisURL)), slog.Any("error", err))
 	} else {
 		rClient = rConn
 		defer rClient.Close()
@@ -150,7 +227,46 @@ func main() {
 		hc.Redis = &RedisPingerAdapter{client: rClient}
 	}
 
-	router := NewRouter(hc)
+	var authHandler *auth.AuthHandler
+	var userHandler *auth.UserHandler
+	var workflowHandler *workflow.WorkflowHandler
+	var authMiddleware *auth.AuthMiddleware
+
+	if dbPool != nil {
+		tenantRepo := tenant.NewTenantRepository(dbPool)
+		userRepo := auth.NewUserRepository(dbPool)
+		uow := postgres.NewUnitOfWork(dbPool)
+		jwtSecret := cfg.JWTSecret
+
+		var blacklist auth.TokenBlacklist
+		var sessionStore auth.SessionStore
+		if rClient != nil {
+			blacklist = auth.NewRedisTokenBlacklist(rClient)
+			sessionStore = auth.NewRedisSessionStoreWithTTL(rClient, cfg.JWTRefreshExpiry)
+		} else {
+			blacklist = auth.NewNoopTokenBlacklist()
+			sessionStore = auth.NewNoopSessionStore()
+		}
+
+		jwtSvc := auth.NewJWTService(jwtSecret, cfg.JWTAccessExpiry, cfg.JWTRefreshExpiry)
+		passSvc := auth.NewPasswordService()
+
+		tenantUC := tenant.NewTenantUseCase(tenantRepo)
+		authUC := auth.NewAuthUseCase(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, cfg.JWTRefreshExpiry)
+		userUC := auth.NewUserUseCaseWithTx(userRepo, passSvc, sessionStore, cfg.JWTRefreshExpiry, uow)
+
+		wfRepo := workflow.NewWorkflowRepository(dbPool)
+		verRepo := workflow.NewVersionRepository(dbPool)
+		auditRepo := workflow.NewAuditRepository(dbPool)
+		wfUC := workflow.NewWorkflowUseCase(wfRepo, verRepo, auditRepo, uow)
+
+		authHandler = auth.NewAuthHandlerWithTrustProxy(authUC, cfg.TrustProxyHeaders)
+		userHandler = auth.NewUserHandler(userUC)
+		workflowHandler = workflow.NewWorkflowHandler(wfUC)
+		authMiddleware = auth.NewAuthMiddlewareWithSessionStore(jwtSvc, blacklist, sessionStore)
+	}
+
+	router := NewRouter(hc, authHandler, userHandler, workflowHandler, authMiddleware)
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
 		Handler:      router,

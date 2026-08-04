@@ -16,6 +16,7 @@ type DBTX interface {
 }
 
 type txKey struct{}
+type dbtxKey struct{}
 
 // ContextWithTx injects an active pgx.Tx into the given context.
 func ContextWithTx(ctx context.Context, tx pgx.Tx) context.Context {
@@ -28,10 +29,24 @@ func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
 	return tx, ok
 }
 
+// ContextWithDBTX injects a DBTX runner override into the given context (for test assertions).
+func ContextWithDBTX(ctx context.Context, db DBTX) context.Context {
+	return context.WithValue(ctx, dbtxKey{}, db)
+}
+
+// DBTXFromContext retrieves a DBTX runner override from context if present.
+func DBTXFromContext(ctx context.Context) (DBTX, bool) {
+	db, ok := ctx.Value(dbtxKey{}).(DBTX)
+	return db, ok
+}
+
 // GetDBTX returns the active transaction from context if available, otherwise returning pool.
 func GetDBTX(ctx context.Context, pool *pgxpool.Pool) DBTX {
 	if tx, ok := TxFromContext(ctx); ok {
 		return tx
+	}
+	if db, ok := DBTXFromContext(ctx); ok {
+		return db
 	}
 	return pool
 }

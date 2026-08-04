@@ -18,6 +18,7 @@ import (
 	"flowforge/internal/platform/postgres"
 	"flowforge/internal/platform/redis"
 	"flowforge/internal/tenant"
+	"flowforge/internal/workflow"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	redisclient "github.com/redis/go-redis/v9"
@@ -114,6 +115,7 @@ func NewRouter(
 	hc *HealthChecker,
 	authHandler *auth.AuthHandler,
 	userHandler *auth.UserHandler,
+	workflowHandler *workflow.WorkflowHandler,
 	authMiddleware *auth.AuthMiddleware,
 ) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -140,6 +142,19 @@ func NewRouter(
 		mux.Handle("GET /api/v1/users/{userId}", authMiddleware.Authenticate(http.HandlerFunc(userHandler.GetUser)))
 		mux.Handle("PATCH /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.UpdateUser))))
 		mux.Handle("DELETE /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.DeleteUser))))
+	}
+
+	if workflowHandler != nil && authMiddleware != nil {
+		mux.Handle("POST /api/v1/workflows", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Create))))
+		mux.Handle("GET /api/v1/workflows", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.List))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.Get))))
+		mux.Handle("PATCH /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Update))))
+		mux.Handle("DELETE /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Archive))))
+		mux.Handle("PUT /api/v1/workflows/{workflowId}/draft", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.SaveDraft))))
+		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/publish", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Publish))))
+		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/{versionId}/rollback", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Rollback))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/versions", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.ListVersions))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/versions/{versionId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.GetVersion))))
 	}
 
 	return mux
@@ -214,6 +229,7 @@ func main() {
 
 	var authHandler *auth.AuthHandler
 	var userHandler *auth.UserHandler
+	var workflowHandler *workflow.WorkflowHandler
 	var authMiddleware *auth.AuthMiddleware
 
 	if dbPool != nil {
@@ -239,12 +255,18 @@ func main() {
 		authUC := auth.NewAuthUseCase(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, cfg.JWTRefreshExpiry)
 		userUC := auth.NewUserUseCaseWithTx(userRepo, passSvc, sessionStore, cfg.JWTRefreshExpiry, uow)
 
+		wfRepo := workflow.NewWorkflowRepository(dbPool)
+		verRepo := workflow.NewVersionRepository(dbPool)
+		auditRepo := workflow.NewAuditRepository(dbPool)
+		wfUC := workflow.NewWorkflowUseCase(wfRepo, verRepo, auditRepo, uow)
+
 		authHandler = auth.NewAuthHandlerWithTrustProxy(authUC, cfg.TrustProxyHeaders)
 		userHandler = auth.NewUserHandler(userUC)
+		workflowHandler = workflow.NewWorkflowHandler(wfUC)
 		authMiddleware = auth.NewAuthMiddlewareWithSessionStore(jwtSvc, blacklist, sessionStore)
 	}
 
-	router := NewRouter(hc, authHandler, userHandler, authMiddleware)
+	router := NewRouter(hc, authHandler, userHandler, workflowHandler, authMiddleware)
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
 		Handler:      router,

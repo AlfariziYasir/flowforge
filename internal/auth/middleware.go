@@ -1,18 +1,12 @@
 package auth
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
 )
-
-type errorResponse struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
-}
 
 type AuthMiddleware struct {
 	jwtService   JWTService
@@ -139,13 +133,4 @@ func RequireRole(allowedRoles ...string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-func respondJSONError(w http.ResponseWriter, status int, errType, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(errorResponse{
-		Error:   errType,
-		Message: msg,
-	})
 }

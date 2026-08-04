@@ -31,6 +31,101 @@ func TestBaseRepository_Unit(t *testing.T) {
 	assert.Equal(t, "users", repo.TableName())
 }
 
+func TestEscapeLike(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "escapes percent sign",
+			input:    "100%",
+			expected: "%100\\%%",
+		},
+		{
+			name:     "escapes underscore",
+			input:    "a_b",
+			expected: "%a\\_b%",
+		},
+		{
+			name:     "escapes backslash first",
+			input:    "back\\slash",
+			expected: "%back\\\\slash%",
+		},
+		{
+			name:     "plain string wrapped in percent",
+			input:    "plain",
+			expected: "%plain%",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, postgres.EscapeLike(tt.input))
+		})
+	}
+}
+
+func TestBaseRepository_PaginateSanitization(t *testing.T) {
+	repo := postgres.NewBaseRepository[TestUserEntity](nil, "users")
+
+	t.Run("rejects non-identifier search column", func(t *testing.T) {
+		_, _, err := repo.Paginate(context.Background(), postgres.PaginationParams{
+			Search: map[string]string{"name FROM users --": "hostile"},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid search column")
+	})
+
+	t.Run("rejects non-identifier filter column", func(t *testing.T) {
+		_, _, err := repo.Paginate(context.Background(), postgres.PaginationParams{
+			Filters: map[string]any{"id; DROP TABLE users; --": "hostile"},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid filter column")
+	})
+
+	t.Run("rejects non-identifier exclude column", func(t *testing.T) {
+		_, _, err := repo.Paginate(context.Background(), postgres.PaginationParams{
+			Exclude: map[string]any{"status; DELETE FROM users; --": "hostile"},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid exclude column")
+	})
+}
+
+func TestBuildPaginateSQL(t *testing.T) {
+	t.Run("empty search map emits no ILIKE predicate", func(t *testing.T) {
+		itemsSQL, _, countSQL, _, err := postgres.BuildPaginateSQL("users", postgres.PaginationParams{
+			Filters: map[string]any{"tenant_id": "t1"},
+		})
+		require.NoError(t, err)
+		assert.NotContains(t, itemsSQL, "ILIKE")
+		assert.NotContains(t, countSQL, "ILIKE")
+		assert.Contains(t, itemsSQL, "tenant_id = $1")
+	})
+
+	t.Run("populated search emits ILIKE predicate with bound argument", func(t *testing.T) {
+		itemsSQL, itemsArgs, countSQL, countArgs, err := postgres.BuildPaginateSQL("users", postgres.PaginationParams{
+			Search: map[string]string{"name": "my_user"},
+		})
+		require.NoError(t, err)
+		assert.Contains(t, itemsSQL, "name ILIKE $1")
+		assert.Contains(t, countSQL, "name ILIKE $1")
+		assert.Equal(t, []any{"%my\\_user%"}, itemsArgs)
+		assert.Equal(t, []any{"%my\\_user%"}, countArgs)
+	})
+
+	t.Run("exclude map emits NotEq predicate", func(t *testing.T) {
+		itemsSQL, itemsArgs, _, _, err := postgres.BuildPaginateSQL("users", postgres.PaginationParams{
+			Exclude: map[string]any{"status": "archived"},
+		})
+		require.NoError(t, err)
+		assert.Contains(t, itemsSQL, "status <> $1")
+		assert.Equal(t, []any{"archived"}, itemsArgs[:1])
+	})
+}
+
 func TestIsUniqueViolation(t *testing.T) {
 	t.Run("returns constraint name for pg 23505 error", func(t *testing.T) {
 		pgErr := &pgconn.PgError{

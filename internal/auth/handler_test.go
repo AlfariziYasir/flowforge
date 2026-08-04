@@ -18,6 +18,7 @@ import (
 	"flowforge/internal/auth"
 	authmocks "flowforge/internal/auth/mocks"
 	"flowforge/internal/domain"
+	"flowforge/internal/platform/httpx"
 	"flowforge/internal/tenant"
 	tenantmocks "flowforge/internal/tenant/mocks"
 )
@@ -72,12 +73,15 @@ func TestAuthHandler_Login(t *testing.T) {
 
 		is.Equal(http.StatusOK, rec.Code)
 
-		var resp map[string]interface{}
-		err := json.Unmarshal(rec.Body.Bytes(), &resp)
+		var env httpx.Envelope
+		err := json.Unmarshal(rec.Body.Bytes(), &env)
 		req.NoError(err)
-		is.NotEmpty(resp["accessToken"])
-		is.NotEmpty(resp["refreshToken"])
-		is.NotNil(resp["user"])
+		is.True(env.Success)
+		data, ok := env.Data.(map[string]interface{})
+		req.True(ok)
+		is.NotEmpty(data["accessToken"])
+		is.NotEmpty(data["refreshToken"])
+		is.NotNil(data["user"])
 	})
 
 	t.Run("returns 401 Unauthorized on invalid password", func(t *testing.T) {
@@ -196,11 +200,14 @@ func TestAuthHandler_GetMe(t *testing.T) {
 
 		is.Equal(http.StatusOK, rec.Code)
 
-		var resp map[string]interface{}
-		err := json.Unmarshal(rec.Body.Bytes(), &resp)
+		var env httpx.Envelope
+		err := json.Unmarshal(rec.Body.Bytes(), &env)
 		req.NoError(err)
-		is.Equal(user.Email, resp["email"])
-		is.Equal(user.Role, resp["role"])
+		is.True(env.Success)
+		data, ok := env.Data.(map[string]interface{})
+		req.True(ok)
+		is.Equal(user.Email, data["email"])
+		is.Equal(user.Role, data["role"])
 	})
 
 	t.Run("returns 404 Not Found when user no longer exists in database", func(t *testing.T) {
@@ -326,10 +333,13 @@ func TestAuthHandler_ListSessions(t *testing.T) {
 
 		is.Equal(http.StatusOK, rec.Code)
 
-		var resp map[string]interface{}
-		err := json.Unmarshal(rec.Body.Bytes(), &resp)
+		var env httpx.Envelope
+		err := json.Unmarshal(rec.Body.Bytes(), &env)
 		req.NoError(err)
-		is.Equal(float64(1), resp["total"])
+		is.True(env.Success)
+		data, ok := env.Data.(map[string]interface{})
+		req.True(ok)
+		is.Equal(float64(1), data["total"])
 	})
 
 	t.Run("returns 401 Unauthorized when auth context is missing", func(t *testing.T) {

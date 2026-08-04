@@ -19,3 +19,12 @@ packages:
     interfaces:
       TenantRepository:
       TenantUseCase:
+  flowforge/internal/workflow:
+    config:
+      dir: "internal/workflow/mocks"
+      outpkg: "mocks"
+    interfaces:
+      WorkflowRepository:
+      VersionRepository:
+      AuditRepository:
+      WorkflowUseCase:

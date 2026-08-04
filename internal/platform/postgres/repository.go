@@ -110,10 +110,18 @@ type PaginationParams struct {
 	Page     int
 	PageSize int
 	OrderBy  string
+	Search   map[string]string
 	Filters  map[string]interface{}
+	Exclude  map[string]interface{}
 }
 
-func (r *BaseRepository[T]) Paginate(ctx context.Context, params PaginationParams) ([]*T, int64, error) {
+var validColumnPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+func BuildPaginateSQL(tableName string, params PaginationParams) (string, []any, string, []any, error) {
+	return buildPaginateSQL(tableName, params)
+}
+
+func buildPaginateSQL(tableName string, params PaginationParams) (string, []any, string, []any, error) {
 	page := params.Page
 	if page < 1 {
 		page = 1
@@ -123,30 +131,44 @@ func (r *BaseRepository[T]) Paginate(ctx context.Context, params PaginationParam
 		pageSize = 20
 	}
 
-	db := r.GetDB(ctx)
-
 	countBuilder := StatementBuilder.
 		Select("COUNT(*)").
-		From(r.tableName)
+		From(tableName)
 
 	itemBuilder := StatementBuilder.
 		Select("*").
-		From(r.tableName)
+		From(tableName)
 
 	for k, v := range params.Filters {
+		if !validColumnPattern.MatchString(k) {
+			return "", nil, "", nil, fmt.Errorf("invalid filter column %q", k)
+		}
 		countBuilder = countBuilder.Where(sq.Eq{k: v})
 		itemBuilder = itemBuilder.Where(sq.Eq{k: v})
 	}
 
-	countQuery, countArgs, err := countBuilder.
-		ToSql()
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to build count sql: %w", err)
+	for k, v := range params.Exclude {
+		if !validColumnPattern.MatchString(k) {
+			return "", nil, "", nil, fmt.Errorf("invalid exclude column %q", k)
+		}
+		countBuilder = countBuilder.Where(sq.NotEq{k: v})
+		itemBuilder = itemBuilder.Where(sq.NotEq{k: v})
 	}
 
-	var total int64
-	if err := db.QueryRow(ctx, countQuery, countArgs...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("failed to count %s records: %w", r.tableName, err)
+	for k, v := range params.Search {
+		if !validColumnPattern.MatchString(k) {
+			return "", nil, "", nil, fmt.Errorf("invalid search column %q", k)
+		}
+		trimmed := strings.TrimSpace(v)
+		if trimmed != "" {
+			countBuilder = countBuilder.Where(sq.ILike{k: escapeLike(trimmed)})
+			itemBuilder = itemBuilder.Where(sq.ILike{k: escapeLike(trimmed)})
+		}
+	}
+
+	countQuery, countArgs, err := countBuilder.ToSql()
+	if err != nil {
+		return "", nil, "", nil, fmt.Errorf("failed to build count sql: %w", err)
 	}
 
 	sanitizedOrder := sanitizeOrderBy(params.OrderBy)
@@ -157,7 +179,23 @@ func (r *BaseRepository[T]) Paginate(ctx context.Context, params PaginationParam
 		Offset(offset).
 		ToSql()
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to build paginated items sql: %w", err)
+		return "", nil, "", nil, fmt.Errorf("failed to build paginated items sql: %w", err)
+	}
+
+	return itemsQuery, itemsArgs, countQuery, countArgs, nil
+}
+
+func (r *BaseRepository[T]) Paginate(ctx context.Context, params PaginationParams) ([]*T, int64, error) {
+	itemsQuery, itemsArgs, countQuery, countArgs, err := buildPaginateSQL(r.tableName, params)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	db := r.GetDB(ctx)
+
+	var total int64
+	if err := db.QueryRow(ctx, countQuery, countArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("failed to count %s records: %w", r.tableName, err)
 	}
 
 	rows, err := db.Query(ctx, itemsQuery, itemsArgs...)
@@ -320,4 +358,15 @@ func structToMap(obj any) (map[string]any, error) {
 	}
 
 	return setMap, nil
+}
+
+func EscapeLike(s string) string {
+	return escapeLike(s)
+}
+
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "%", "\\%")
+	s = strings.ReplaceAll(s, "_", "\\_")
+	return "%" + s + "%"
 }

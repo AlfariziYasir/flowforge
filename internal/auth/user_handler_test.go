@@ -15,6 +15,7 @@ import (
 	"flowforge/internal/auth"
 	authmocks "flowforge/internal/auth/mocks"
 	"flowforge/internal/domain"
+	"flowforge/internal/platform/httpx"
 )
 
 func TestUserHandler_CreateUser(t *testing.T) {
@@ -59,6 +60,9 @@ func TestUserHandler_CreateUser(t *testing.T) {
 		handler.CreateUser(rec, httpReq.WithContext(ctx))
 
 		req.Equal(http.StatusCreated, rec.Code)
+		var env httpx.Envelope
+		req.NoError(json.Unmarshal(rec.Body.Bytes(), &env))
+		is.True(env.Success)
 		is.Contains(rec.Body.String(), "new@flowforge.local")
 	})
 
@@ -74,6 +78,10 @@ func TestUserHandler_CreateUser(t *testing.T) {
 		handler.CreateUser(rec, httpReq)
 
 		is.Equal(http.StatusUnauthorized, rec.Code)
+		var env httpx.Envelope
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		is.False(env.Success)
+		is.Equal(httpx.CodeAuthUnauthorized, env.Error.Code)
 	})
 
 	t.Run("returns 409 Conflict when user email already exists", func(t *testing.T) {
@@ -98,6 +106,10 @@ func TestUserHandler_CreateUser(t *testing.T) {
 		handler.CreateUser(rec, httpReq.WithContext(ctx))
 
 		is.Equal(http.StatusConflict, rec.Code)
+		var env httpx.Envelope
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		is.False(env.Success)
+		is.Equal(httpx.CodeConflict, env.Error.Code)
 	})
 }
 
@@ -135,6 +147,9 @@ func TestUserHandler_ListUsers(t *testing.T) {
 		handler.ListUsers(rec, httpReq.WithContext(ctx))
 
 		req.Equal(http.StatusOK, rec.Code)
+		var env httpx.Envelope
+		req.NoError(json.Unmarshal(rec.Body.Bytes(), &env))
+		is.True(env.Success)
 		is.Contains(rec.Body.String(), "user1@flowforge.local")
 	})
 }
@@ -191,6 +206,10 @@ func TestUserHandler_GetUser(t *testing.T) {
 		handler.GetUser(rec, httpReq.WithContext(ctx))
 
 		is.Equal(http.StatusNotFound, rec.Code)
+		var env httpx.Envelope
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		is.False(env.Success)
+		is.Equal(httpx.CodeNotFound, env.Error.Code)
 	})
 
 	t.Run("returns 400 Bad Request on invalid uuid format", func(t *testing.T) {
@@ -207,6 +226,10 @@ func TestUserHandler_GetUser(t *testing.T) {
 		handler.GetUser(rec, httpReq.WithContext(ctx))
 
 		is.Equal(http.StatusBadRequest, rec.Code)
+		var env httpx.Envelope
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		is.False(env.Success)
+		is.Equal(httpx.CodeInvalidRequestBody, env.Error.Code)
 	})
 }
 

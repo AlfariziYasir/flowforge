@@ -7,6 +7,8 @@ import (
 	"strconv"
 
 	"github.com/google/uuid"
+
+	"flowforge/internal/platform/httpx"
 )
 
 // UserHandler handles HTTP transport for user management.
@@ -62,7 +64,7 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusCreated, user)
+	httpx.Created(w, user)
 }
 
 // ListUsers handles GET /api/v1/users.
@@ -109,7 +111,7 @@ func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, res)
+	httpx.OK(w, res)
 }
 
 // GetUser handles GET /api/v1/users/{userId}.
@@ -137,7 +139,7 @@ func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, user)
+	httpx.OK(w, user)
 }
 
 // UpdateUser handles PATCH /api/v1/users/{userId}.
@@ -194,7 +196,7 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, user)
+	httpx.OK(w, user)
 }
 
 // DeleteUser handles DELETE /api/v1/users/{userId}.
@@ -225,7 +227,7 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, map[string]string{
+	httpx.OK(w, map[string]string{
 		"status":  "success",
 		"message": "user deleted successfully",
 	})

@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"flowforge/internal/auth"
 	authmocks "flowforge/internal/auth/mocks"
+	"flowforge/internal/platform/httpx"
 )
 
 func TestAuthMiddleware(t *testing.T) {
@@ -40,6 +42,10 @@ func TestAuthMiddleware(t *testing.T) {
 		middleware.Authenticate(dummyHandler).ServeHTTP(rec, req)
 
 		is.Equal(http.StatusUnauthorized, rec.Code)
+		var env httpx.Envelope
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		is.False(env.Success)
+		is.Equal(httpx.CodeAuthUnauthorized, env.Error.Code)
 	})
 
 	t.Run("returns 401 Unauthorized when Authorization format is invalid", func(t *testing.T) {
@@ -52,6 +58,10 @@ func TestAuthMiddleware(t *testing.T) {
 		middleware.Authenticate(dummyHandler).ServeHTTP(rec, req)
 
 		is.Equal(http.StatusUnauthorized, rec.Code)
+		var env httpx.Envelope
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		is.False(env.Success)
+		is.Equal(httpx.CodeAuthUnauthorized, env.Error.Code)
 	})
 
 	t.Run("returns 401 Unauthorized when token is invalid or expired", func(t *testing.T) {
@@ -64,6 +74,10 @@ func TestAuthMiddleware(t *testing.T) {
 		middleware.Authenticate(dummyHandler).ServeHTTP(rec, req)
 
 		is.Equal(http.StatusUnauthorized, rec.Code)
+		var env httpx.Envelope
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		is.False(env.Success)
+		is.Equal(httpx.CodeAuthUnauthorized, env.Error.Code)
 	})
 
 	t.Run("injects AuthUser into context and calls next handler on valid token", func(t *testing.T) {

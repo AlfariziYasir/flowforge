@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -8,9 +9,13 @@ import (
 
 	"flowforge/internal/auth"
 	"flowforge/internal/platform/config"
+	"flowforge/internal/workflow"
+	workflowmocks "flowforge/internal/workflow/mocks"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidateJWTSecret(t *testing.T) {
@@ -114,4 +119,51 @@ func TestNewRouter_UserListRequiresElevatedRole(t *testing.T) {
 		middleware.Authenticate(dummyHandler).ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
+}
+
+func TestNewRouter_WorkflowRoutesWiring(t *testing.T) {
+	router := NewRouter(nil, nil, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workflows", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestNewRouter_PublishVsRollbackRouteDisambiguation(t *testing.T) {
+	jwtSvc := auth.NewJWTService("router-test-secret-key-32chars!!", 15*time.Minute, 7*24*time.Hour)
+	middleware := auth.NewAuthMiddleware(jwtSvc)
+
+	wfID := uuid.New()
+	verID := uuid.New()
+	tenantID := uuid.New()
+	userID := uuid.New()
+
+	mockUC := workflowmocks.NewMockWorkflowUseCase(t)
+	mockUC.EXPECT().PublishVersion(mock.Anything, mock.Anything).Return(&workflow.PublishResult{WorkflowID: wfID, VersionID: verID, VersionNumber: 1, Status: "published"}, nil).Once()
+	mockUC.EXPECT().RollbackVersion(mock.Anything, mock.Anything).Return(&workflow.RollbackResult{WorkflowID: wfID, VersionID: verID, VersionNumber: 2, Status: "draft"}, nil).Once()
+
+	wfHandler := workflow.NewWorkflowHandler(mockUC)
+	router := NewRouter(nil, nil, nil, wfHandler, middleware)
+
+	pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, uuid.Nil, "admin@flowforge.local", "admin")
+	require.NoError(t, err)
+
+	// Test publish route
+	pubBody := []byte(`{"rowVersion":1}`)
+	reqPub := httptest.NewRequest(http.MethodPost, "/api/v1/workflows/"+wfID.String()+"/versions/publish", bytes.NewReader(pubBody))
+	reqPub.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	recPub := httptest.NewRecorder()
+	router.ServeHTTP(recPub, reqPub)
+
+	assert.Equal(t, http.StatusOK, recPub.Code)
+
+	// Test rollback route
+	rollBody := []byte(`{"rowVersion":1}`)
+	reqRoll := httptest.NewRequest(http.MethodPost, "/api/v1/workflows/"+wfID.String()+"/versions/"+verID.String()+"/rollback", bytes.NewReader(rollBody))
+	reqRoll.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	recRoll := httptest.NewRecorder()
+	router.ServeHTTP(recRoll, reqRoll)
+
+	assert.Equal(t, http.StatusOK, recRoll.Code)
 }

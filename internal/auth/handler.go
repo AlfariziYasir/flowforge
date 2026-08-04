@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"flowforge/internal/platform/httpx"
 )
 
 type LoginRequest struct {
@@ -72,7 +74,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, res)
+	httpx.OK(w, res)
 }
 
 func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +105,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, res)
+	httpx.OK(w, res)
 }
 
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
@@ -119,7 +121,7 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, map[string]string{
+	httpx.OK(w, map[string]string{
 		"status":  "success",
 		"message": "logged out successfully",
 	})
@@ -137,7 +139,7 @@ func (h *AuthHandler) LogoutAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, map[string]string{
+	httpx.OK(w, map[string]string{
 		"status":  "success",
 		"message": "all devices logged out successfully",
 	})
@@ -174,7 +176,7 @@ func (h *AuthHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, res)
+	httpx.OK(w, res)
 }
 
 func (h *AuthHandler) GetMe(w http.ResponseWriter, r *http.Request) {
@@ -194,11 +196,24 @@ func (h *AuthHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, user)
+	httpx.OK(w, user)
 }
 
-func respondJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+func respondJSONError(w http.ResponseWriter, status int, errType, msg string) {
+	code := httpx.CodeInternalServerError
+	switch status {
+	case http.StatusUnauthorized:
+		code = httpx.CodeAuthUnauthorized
+	case http.StatusForbidden:
+		code = httpx.CodeAuthForbidden
+	case http.StatusBadRequest:
+		code = httpx.CodeInvalidRequestBody
+	case http.StatusNotFound:
+		code = httpx.CodeNotFound
+	case http.StatusConflict:
+		code = httpx.CodeConflict
+	case http.StatusUnprocessableEntity:
+		code = httpx.CodeValidationError
+	}
+	httpx.Fail(w, status, code, msg)
 }

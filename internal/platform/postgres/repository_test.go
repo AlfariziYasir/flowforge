@@ -157,10 +157,7 @@ func TestBaseRepository_Integration(t *testing.T) {
 
 	t.Run("FindByID success", func(t *testing.T) {
 		user, err := repo.FindByFilter(ctx, map[string]interface{}{"tenant_id": tenantID, "id": userID})
-		if errorsIs(err, domain.ErrNotFound) {
-			t.Skip("seed user not found in database, skipping live row assertion")
-		}
-		require.NoError(t, err)
+		require.NoError(t, err, "seed user tidak ditemukan — jalankan `make up` yang memuat migrations/seed.sql")
 		require.NotNil(t, user)
 		assert.Equal(t, userID, user.ID)
 		assert.Equal(t, tenantID, user.TenantID)
@@ -206,17 +203,19 @@ func TestBaseRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("Create Success", func(t *testing.T) {
+		_, err := pool.Exec(ctx, "DELETE FROM users WHERE tenant_id = $1 AND email = $2", tenantID, "[EMAIL_ADDRESS]")
+		require.NoError(t, err, "pre-clean of prior test row")
 		user := &TestUserEntity{
 			ID:           uuid.NewString(),
 			TenantID:     tenantID,
 			Email:        "[EMAIL_ADDRESS]",
 			PasswordHash: "password",
-			Role:         "user",
+			Role:         "viewer",
 			IsActive:     true,
 			CreatedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
 		}
-		err := repo.Create(ctx, user)
+		err = repo.Create(ctx, user)
 		require.NoError(t, err)
 	})
 }

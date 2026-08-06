@@ -90,7 +90,7 @@ func validateStructure(g domain.Graph) error {
 		return fmt.Errorf("%w: graph has no nodes", domain.ErrInvalidDAG)
 	}
 
-	known := make(map[string]struct{}, len(g.Nodes))
+	known := make(map[string]string, len(g.Nodes)) // key -> nodeType
 	for _, n := range g.Nodes {
 		if strings.TrimSpace(n.NodeKey) == "" {
 			return fmt.Errorf("%w: node key must not be blank", domain.ErrInvalidDAG)
@@ -101,12 +101,13 @@ func validateStructure(g domain.Graph) error {
 		if !domain.IsValidNodeType(n.NodeType) {
 			return fmt.Errorf("%w: node %q has unknown type %q", domain.ErrInvalidDAG, n.NodeKey, n.NodeType)
 		}
-		known[n.NodeKey] = struct{}{}
+		known[n.NodeKey] = n.NodeType
 	}
 
 	seenEdges := make(map[domain.EdgeInput]struct{}, len(g.Edges))
 	for _, e := range g.Edges {
-		if _, ok := known[e.From]; !ok {
+		fromType, ok := known[e.From]
+		if !ok {
 			return fmt.Errorf("%w: edge references unknown node %q", domain.ErrInvalidDAG, e.From)
 		}
 		if _, ok := known[e.To]; !ok {
@@ -115,10 +116,27 @@ func validateStructure(g domain.Graph) error {
 		if e.From == e.To {
 			return fmt.Errorf("%w: node %q has an edge to itself", domain.ErrCycleDetected, e.From)
 		}
-		if _, dup := seenEdges[e]; dup {
-			return fmt.Errorf("%w: duplicate edge %q -> %q", domain.ErrInvalidDAG, e.From, e.To)
+
+		branch := e.Branch
+		if branch == "" {
+			branch = "default"
 		}
-		seenEdges[e] = struct{}{}
+
+		if fromType == domain.NodeTypeCondition {
+			if branch != "true" && branch != "false" {
+				return fmt.Errorf("%w: condition node %q outgoing edge must specify branch 'true' or 'false', got %q", domain.ErrInvalidDAG, e.From, e.Branch)
+			}
+		} else {
+			if branch != "default" {
+				return fmt.Errorf("%w: non-condition node %q outgoing edge cannot specify branch %q", domain.ErrInvalidDAG, e.From, e.Branch)
+			}
+		}
+
+		normEdge := domain.EdgeInput{From: e.From, To: e.To, Branch: branch}
+		if _, dup := seenEdges[normEdge]; dup {
+			return fmt.Errorf("%w: duplicate edge %q -> %q (branch %q)", domain.ErrInvalidDAG, e.From, e.To, branch)
+		}
+		seenEdges[normEdge] = struct{}{}
 	}
 
 	return nil

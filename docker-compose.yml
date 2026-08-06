@@ -33,11 +33,27 @@ services:
       retries: 5
     restart: unless-stopped
 
+  nats:
+    image: nats:2-alpine
+    container_name: flowforge-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   migrate:
     image: migrate/migrate:v4.18.2
     container_name: flowforge-migrate
     volumes:
-      - ./migrations:/migrations
+      - ./migrations:/migrations:z
     command:
       - -path=/migrations
       - -database=postgres://postgres:postgres@postgres:5432/flowforge?sslmode=disable
@@ -51,7 +67,7 @@ services:
     image: postgres:17-alpine
     container_name: flowforge-seed
     volumes:
-      - ./migrations/seed.sql:/seed.sql:ro
+      - ./migrations/seed.sql:/seed.sql:ro,z
     environment:
       PGPASSWORD: postgres
     command:
@@ -115,6 +131,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      nats:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
@@ -122,3 +140,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  nats_data:

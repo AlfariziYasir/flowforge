@@ -30,15 +30,26 @@ type NodeInput struct {
 }
 
 // EdgeInput is a directed graph edge in wire form. From and To are node keys.
+// Branch specifies control-flow branch for CONDITION nodes ("true", "false", or "default").
 type EdgeInput struct {
-	From string `json:"from"`
-	To   string `json:"to"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Branch string `json:"branch,omitempty"`
 }
 
 // Graph is the wire form of a workflow definition.
 type Graph struct {
 	Nodes []NodeInput `json:"nodes"`
 	Edges []EdgeInput `json:"edges"`
+}
+
+// Normalize ensures all edges have an explicit branch label, mapping empty string to "default".
+func (g *Graph) Normalize() {
+	for i := range g.Edges {
+		if g.Edges[i].Branch == "" {
+			g.Edges[i].Branch = "default"
+		}
+	}
 }
 
 // emptyConfig is the value written when a node supplies no config. The column is
@@ -92,12 +103,18 @@ func (g Graph) ToPersisted(tenantID, versionID uuid.UUID, now time.Time) ([]Work
 			return nil, nil, fmt.Errorf("%w: edge references unknown node %q", ErrInvalidDAG, in.To)
 		}
 
+		branch := in.Branch
+		if branch == "" {
+			branch = "default"
+		}
+
 		edges = append(edges, WorkflowEdge{
 			ID:                uuid.New(),
 			TenantID:          tenantID,
 			WorkflowVersionID: versionID,
 			FromNodeID:        fromID,
 			ToNodeID:          toID,
+			Branch:            branch,
 			CreatedAt:         now,
 		})
 	}
@@ -108,7 +125,7 @@ func (g Graph) ToPersisted(tenantID, versionID uuid.UUID, now time.Time) ([]Work
 // FromPersisted rebuilds the wire form from stored rows, mapping node UUIDs back
 // to keys.
 //
-// The output is canonical: nodes are sorted by NodeKey and edges by (From, To),
+// The output is canonical: nodes are sorted by NodeKey and edges by (From, To, Branch),
 // regardless of the order rows arrive in. Publish checksums depend on this — an
 // identical graph must always marshal to identical bytes.
 //
@@ -140,9 +157,14 @@ func FromPersisted(nodes []WorkflowNode, edges []WorkflowEdge) Graph {
 	}
 
 	for _, e := range edges {
+		branch := e.Branch
+		if branch == "" {
+			branch = "default"
+		}
 		out.Edges = append(out.Edges, EdgeInput{
-			From: keyByID[e.FromNodeID],
-			To:   keyByID[e.ToNodeID],
+			From:   keyByID[e.FromNodeID],
+			To:     keyByID[e.ToNodeID],
+			Branch: branch,
 		})
 	}
 
@@ -153,7 +175,10 @@ func FromPersisted(nodes []WorkflowNode, edges []WorkflowEdge) Graph {
 		if out.Edges[i].From != out.Edges[j].From {
 			return out.Edges[i].From < out.Edges[j].From
 		}
-		return out.Edges[i].To < out.Edges[j].To
+		if out.Edges[i].To != out.Edges[j].To {
+			return out.Edges[i].To < out.Edges[j].To
+		}
+		return out.Edges[i].Branch < out.Edges[j].Branch
 	})
 
 	return out

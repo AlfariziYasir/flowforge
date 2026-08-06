@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+// Generic event-delivery contract for FlowForge's gRPC ingress/egress adapters
+// (Phase 7, decision D-4). This is a working placeholder pending the real
+// external system's actual proto spec; adapting field names is isolated to
+// internal/platform/eventbus.
+package flowforge.events.v1;
+
+option go_package = "flowforge/internal/platform/eventbus/eventspb";
+
+service EventListener {
+  rpc DeliverEvent(DeliverEventRequest) returns (DeliverEventResponse);
+}
+
+message DeliverEventRequest {
+  string correlation_key = 1;
+  bytes payload_json = 2;
+}
+
+message DeliverEventResponse {
+  bool accepted = 1; // mirrors the HTTP path: always true, matching/no-match is internal
+}

@@ -27,6 +27,13 @@ const (
 	CodeInternalServerError      = "INTERNAL_SERVER_ERROR"
 	CodeNotFound                 = "NOT_FOUND"
 	CodeConflict                 = "CONFLICT"
+
+	CodeRunNotFound         = "RUN_NOT_FOUND"
+	CodeRunAlreadyRunning   = "RUN_ALREADY_RUNNING"
+	CodeRunAlreadyCompleted = "RUN_ALREADY_COMPLETED"
+	CodeStepNotFound        = "STEP_NOT_FOUND"
+	CodeAIInvalidResponse   = "AI_INVALID_RESPONSE"
+	CodeAIGenerationFailed  = "AI_GENERATION_FAILED"
 )
 
 type Envelope struct {
@@ -95,6 +102,17 @@ func OK(w http.ResponseWriter, data any) {
 
 func Created(w http.ResponseWriter, data any) {
 	writeJSON(w, http.StatusCreated, Envelope{
+		Success: true,
+		Data:    data,
+		Meta:    nil,
+		Error:   nil,
+	})
+}
+
+// Accepted acknowledges a request that is durably recorded and will be
+// processed asynchronously (e.g. a triggered workflow run).
+func Accepted(w http.ResponseWriter, data any) {
+	writeJSON(w, http.StatusAccepted, Envelope{
 		Success: true,
 		Data:    data,
 		Meta:    nil,

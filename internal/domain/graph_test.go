@@ -21,7 +21,7 @@ func node(key, nodeType string) domain.NodeInput {
 }
 
 func edge(from, to string) domain.EdgeInput {
-	return domain.EdgeInput{From: from, To: to}
+	return domain.EdgeInput{From: from, To: to, Branch: "default"}
 }
 
 // T-27: ToPersisted assigns distinct UUIDs and resolves every edge endpoint.
@@ -234,6 +234,77 @@ func TestFromPersisted_Canonical(t *testing.T) {
 		got := domain.FromPersisted(nodes, []domain.WorkflowEdge{orphan})
 		require.Len(t, got.Edges, 1)
 		assert.Equal(t, "", got.Edges[0].To)
+	})
+}
+
+// P-1: ToPersisted round-trips Branch and preserves condition node edges to same target.
+func TestGraph_BranchSupport(t *testing.T) {
+	tenantID := uuid.New()
+	versionID := uuid.New()
+	now := time.Now()
+
+	t.Run("P-1: condition node with two edges to same target on different branches", func(t *testing.T) {
+		g := domain.Graph{
+			Nodes: []domain.NodeInput{
+				node("cond", domain.NodeTypeCondition),
+				node("target", domain.NodeTypeHTTP),
+			},
+			Edges: []domain.EdgeInput{
+				{From: "cond", To: "target", Branch: "true"},
+				{From: "cond", To: "target", Branch: "false"},
+			},
+		}
+
+		nodes, edges, err := g.ToPersisted(tenantID, versionID, now)
+		require.NoError(t, err)
+		require.Len(t, nodes, 2)
+		require.Len(t, edges, 2)
+
+		assert.Equal(t, "true", edges[0].Branch)
+		assert.Equal(t, "false", edges[1].Branch)
+
+		rebuilt := domain.FromPersisted(nodes, edges)
+		require.Len(t, rebuilt.Edges, 2)
+	})
+
+	t.Run("P-2: FromPersisted orders by (From, To, Branch) avoiding checksum collisions", func(t *testing.T) {
+		g1 := domain.Graph{
+			Nodes: []domain.NodeInput{
+				node("cond", domain.NodeTypeCondition),
+				node("out1", domain.NodeTypeHTTP),
+			},
+			Edges: []domain.EdgeInput{
+				{From: "cond", To: "out1", Branch: "true"},
+			},
+		}
+
+		g2 := domain.Graph{
+			Nodes: []domain.NodeInput{
+				node("cond", domain.NodeTypeCondition),
+				node("out1", domain.NodeTypeHTTP),
+			},
+			Edges: []domain.EdgeInput{
+				{From: "cond", To: "out1", Branch: "false"},
+			},
+		}
+
+		b1, err1 := json.Marshal(g1)
+		require.NoError(t, err1)
+		b2, err2 := json.Marshal(g2)
+		require.NoError(t, err2)
+
+		assert.NotEqual(t, string(b1), string(b2), "graphs differing only in branch label must marshal to distinct bytes")
+	})
+
+	t.Run("P-2b: snapshot decoded without branch key normalizes to default", func(t *testing.T) {
+		rawJSON := `{"nodes":[{"nodeKey":"a","nodeType":"HTTP"}],"edges":[{"from":"a","to":"b"}]}`
+		var g domain.Graph
+		err := json.Unmarshal([]byte(rawJSON), &g)
+		require.NoError(t, err)
+		assert.Equal(t, "", g.Edges[0].Branch)
+
+		g.Normalize()
+		assert.Equal(t, "default", g.Edges[0].Branch)
 	})
 }
 

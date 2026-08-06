@@ -469,9 +469,13 @@ func (r *postgresVersionRepository) ReplaceGraph(ctx context.Context, tenantID, 
 
 	// 4. Insert edges
 	for _, e := range edges {
+		branch := e.Branch
+		if branch == "" {
+			branch = "default"
+		}
 		insEdgeSQL, insEdgeArgs, err := psql.Insert("workflow_edges").
-			Columns("id", "tenant_id", "workflow_version_id", "from_node_id", "to_node_id", "created_at").
-			Values(e.ID, tenantID, versionID, e.FromNodeID, e.ToNodeID, e.CreatedAt).
+			Columns("id", "tenant_id", "workflow_version_id", "from_node_id", "to_node_id", "branch", "created_at").
+			Values(e.ID, tenantID, versionID, e.FromNodeID, e.ToNodeID, branch, e.CreatedAt).
 			ToSql()
 		if err != nil {
 			return fmt.Errorf("build insert edge sql: %w", err)
@@ -505,7 +509,7 @@ func (r *postgresVersionRepository) LoadGraph(ctx context.Context, tenantID, ver
 		return nil, nil, fmt.Errorf("collect node rows: %w", err)
 	}
 
-	edgesSQL, edgesArgs, err := psql.Select("id", "tenant_id", "workflow_version_id", "from_node_id", "to_node_id", "created_at").
+	edgesSQL, edgesArgs, err := psql.Select("id", "tenant_id", "workflow_version_id", "from_node_id", "to_node_id", "branch", "created_at").
 		From("workflow_edges").
 		Where(sq.Eq{"tenant_id": tenantID, "workflow_version_id": versionID}).
 		ToSql()

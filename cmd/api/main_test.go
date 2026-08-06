@@ -122,7 +122,7 @@ func TestNewRouter_UserListRequiresElevatedRole(t *testing.T) {
 }
 
 func TestNewRouter_WorkflowRoutesWiring(t *testing.T) {
-	router := NewRouter(nil, nil, nil, nil, nil)
+	router := NewRouter(nil, nil, nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/workflows", nil)
 	rec := httptest.NewRecorder()
 
@@ -144,7 +144,7 @@ func TestNewRouter_PublishVsRollbackRouteDisambiguation(t *testing.T) {
 	mockUC.EXPECT().RollbackVersion(mock.Anything, mock.Anything).Return(&workflow.RollbackResult{WorkflowID: wfID, VersionID: verID, VersionNumber: 2, Status: "draft"}, nil).Once()
 
 	wfHandler := workflow.NewWorkflowHandler(mockUC)
-	router := NewRouter(nil, nil, nil, wfHandler, middleware)
+	router := NewRouter(nil, nil, nil, wfHandler, nil, middleware)
 
 	pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, uuid.Nil, "admin@flowforge.local", "admin")
 	require.NoError(t, err)

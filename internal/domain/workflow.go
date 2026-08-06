@@ -25,16 +25,19 @@ const (
 
 // Node types, mirroring the CHECK on workflow_nodes.node_type.
 const (
-	NodeTypeHTTP      = "HTTP"
-	NodeTypeDelay     = "DELAY"
-	NodeTypeCondition = "CONDITION"
-	NodeTypeTransform = "TRANSFORM"
+	NodeTypeHTTP         = "HTTP"
+	NodeTypeDelay        = "DELAY"
+	NodeTypeCondition    = "CONDITION"
+	NodeTypeTransform    = "TRANSFORM"
+	NodeTypeEventPublish = "EVENT_PUBLISH"
+	NodeTypeEventWait    = "EVENT_WAIT"
 )
 
-// IsValidNodeType reports whether t is one of the four supported node types.
+// IsValidNodeType reports whether t is one of the supported node types.
 func IsValidNodeType(t string) bool {
 	switch t {
-	case NodeTypeHTTP, NodeTypeDelay, NodeTypeCondition, NodeTypeTransform:
+	case NodeTypeHTTP, NodeTypeDelay, NodeTypeCondition, NodeTypeTransform,
+		NodeTypeEventPublish, NodeTypeEventWait:
 		return true
 	default:
 		return false
@@ -98,5 +101,6 @@ type WorkflowEdge struct {
 	WorkflowVersionID uuid.UUID `db:"workflow_version_id" json:"-"`
 	FromNodeID        uuid.UUID `db:"from_node_id" json:"-"`
 	ToNodeID          uuid.UUID `db:"to_node_id" json:"-"`
+	Branch            string    `db:"branch" json:"branch"`
 	CreatedAt         time.Time `db:"created_at" json:"-"`
 }

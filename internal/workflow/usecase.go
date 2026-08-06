@@ -39,11 +39,11 @@ type WorkflowUseCase interface {
 type workflowUseCase struct {
 	wfRepo    WorkflowRepository
 	verRepo   VersionRepository
-	auditRepo AuditRepository
+	auditRepo domain.AuditRepository
 	txRunner  TxRunner
 }
 
-func NewWorkflowUseCase(wfRepo WorkflowRepository, verRepo VersionRepository, auditRepo AuditRepository, txRunner TxRunner) WorkflowUseCase {
+func NewWorkflowUseCase(wfRepo WorkflowRepository, verRepo VersionRepository, auditRepo domain.AuditRepository, txRunner TxRunner) WorkflowUseCase {
 	if txRunner == nil {
 		panic("workflow: UnitOfWork txRunner cannot be nil")
 	}
@@ -97,7 +97,7 @@ func (uc *workflowUseCase) CreateWorkflow(ctx context.Context, cmd CreateWorkflo
 			return err
 		}
 		meta, _ := json.Marshal(map[string]any{"name": wf.Name})
-		return uc.auditRepo.Record(txCtx, AuditEntry{
+		return uc.auditRepo.Record(txCtx, domain.AuditEntry{
 			TenantID:    cmd.TenantID,
 			ActorUserID: &cmd.ActorID,
 			Action:      ActionWorkflowCreated,
@@ -197,7 +197,7 @@ func (uc *workflowUseCase) UpdateWorkflow(ctx context.Context, cmd UpdateWorkflo
 			return err
 		}
 		meta, _ := json.Marshal(map[string]any{"name": wf.Name})
-		return uc.auditRepo.Record(txCtx, AuditEntry{
+		return uc.auditRepo.Record(txCtx, domain.AuditEntry{
 			TenantID:    cmd.TenantID,
 			ActorUserID: &cmd.ActorID,
 			Action:      ActionWorkflowUpdated,
@@ -230,7 +230,7 @@ func (uc *workflowUseCase) ArchiveWorkflow(ctx context.Context, cmd ArchiveWorkf
 		if err := uc.wfRepo.UpdateStatus(txCtx, cmd.TenantID, cmd.WorkflowID, domain.WorkflowStatusArchived, cmd.RowVersion); err != nil {
 			return err
 		}
-		return uc.auditRepo.Record(txCtx, AuditEntry{
+		return uc.auditRepo.Record(txCtx, domain.AuditEntry{
 			TenantID:    cmd.TenantID,
 			ActorUserID: &cmd.ActorID,
 			Action:      ActionWorkflowArchived,
@@ -296,7 +296,7 @@ func (uc *workflowUseCase) SaveDraft(ctx context.Context, cmd SaveDraftCommand) 
 		}
 
 		meta, _ := json.Marshal(map[string]any{"versionNumber": draftVer.VersionNumber})
-		return uc.auditRepo.Record(txCtx, AuditEntry{
+		return uc.auditRepo.Record(txCtx, domain.AuditEntry{
 			TenantID:    cmd.TenantID,
 			ActorUserID: &cmd.ActorID,
 			Action:      ActionWorkflowDraftSaved,
@@ -330,12 +330,22 @@ func (uc *workflowUseCase) GetVersion(ctx context.Context, tenantID, workflowID,
 		return nil, err
 	}
 
-	nodes, edges, err := uc.verRepo.LoadGraph(ctx, tenantID, versionID)
-	if err != nil {
-		return nil, err
+	var g domain.Graph
+	if ver.Status == domain.VersionStatusDraft {
+		// A draft's snapshot is still '{}'; its graph lives in the nodes/edges rows.
+		nodes, edges, err := uc.verRepo.LoadGraph(ctx, tenantID, versionID)
+		if err != nil {
+			return nil, err
+		}
+		g = domain.FromPersisted(nodes, edges)
+	} else {
+		// A published version's snapshot is the truth; that is what immutability is for.
+		if err := json.Unmarshal(ver.GraphSnapshot, &g); err != nil {
+			return nil, fmt.Errorf("unmarshal graph snapshot for version %s: %w", versionID, err)
+		}
+		g.Normalize() // B-6: older snapshots carry no "branch" key
 	}
 
-	g := domain.FromPersisted(nodes, edges)
 	return &VersionDetail{
 		Version: ver,
 		Graph:   g,
@@ -434,7 +444,7 @@ func (uc *workflowUseCase) PublishVersion(ctx context.Context, cmd PublishComman
 			"versionNumber": draftVer.VersionNumber,
 			"checksum":      checksum,
 		})
-		if err := uc.auditRepo.Record(txCtx, AuditEntry{
+		if err := uc.auditRepo.Record(txCtx, domain.AuditEntry{
 			TenantID:    cmd.TenantID,
 			ActorUserID: &cmd.ActorID,
 			Action:      ActionWorkflowPublished,
@@ -558,7 +568,7 @@ func (uc *workflowUseCase) RollbackVersion(ctx context.Context, cmd RollbackComm
 			"rollbackToVersion": targetVer.VersionNumber,
 			"newVersionNumber":  newPublishedNum,
 		})
-		if err := uc.auditRepo.Record(txCtx, AuditEntry{
+		if err := uc.auditRepo.Record(txCtx, domain.AuditEntry{
 			TenantID:    cmd.TenantID,
 			ActorUserID: &cmd.ActorID,
 			Action:      ActionWorkflowRolledBack,

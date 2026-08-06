@@ -239,6 +239,41 @@ func TestValidateDAG_SingleNode(t *testing.T) {
 	assert.Equal(t, []string{"only"}, order)
 }
 
+func TestValidateDAG_BranchValidation(t *testing.T) {
+	t.Run("P-3: rejects condition node with default outgoing edge", func(t *testing.T) {
+		g := graph(
+			[]domain.NodeInput{typedNode("cond", domain.NodeTypeCondition), typedNode("b", domain.NodeTypeHTTP)},
+			[]domain.EdgeInput{{From: "cond", To: "b", Branch: "default"}},
+		)
+		err := engine.ValidateDAG(g)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, domain.ErrInvalidDAG)
+		assert.Contains(t, err.Error(), "must specify branch 'true' or 'false'")
+	})
+
+	t.Run("P-4: rejects non-condition node with true or false edge", func(t *testing.T) {
+		g := graph(
+			[]domain.NodeInput{typedNode("http", domain.NodeTypeHTTP), typedNode("b", domain.NodeTypeHTTP)},
+			[]domain.EdgeInput{{From: "http", To: "b", Branch: "true"}},
+		)
+		err := engine.ValidateDAG(g)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, domain.ErrInvalidDAG)
+		assert.Contains(t, err.Error(), "cannot specify branch")
+	})
+
+	t.Run("P-4b: condition node with two edges on different branches is valid", func(t *testing.T) {
+		g := graph(
+			[]domain.NodeInput{typedNode("cond", domain.NodeTypeCondition), typedNode("b", domain.NodeTypeHTTP)},
+			[]domain.EdgeInput{
+				{From: "cond", To: "b", Branch: "true"},
+				{From: "cond", To: "b", Branch: "false"},
+			},
+		)
+		assert.NoError(t, engine.ValidateDAG(g))
+	})
+}
+
 func indexOf(s []string, target string) int {
 	for i, v := range s {
 		if v == target {

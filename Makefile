@@ -1,4 +1,4 @@
-.PHONY: mocks test build vet fmt fmt-check install-mockery
+.PHONY: mocks test build vet fmt fmt-check install-mockery up down test-integration
 
 # Install mockery if not present
 install-mockery:
@@ -30,4 +30,15 @@ vet:
 
 # CI pipeline gate
 ci: fmt-check vet build test
+
+# Nyalakan dependensi untuk integration test (tanpa api/worker)
+up:
+	docker compose up -d postgres redis migrate seed
+
+down:
+	docker compose down
+
+# Integration test — butuh `make up` lebih dulu
+test-integration:
+	FLOWFORGE_INTEGRATION=1 go test ./internal/... -race -count=1
 

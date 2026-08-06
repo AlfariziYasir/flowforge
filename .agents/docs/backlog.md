@@ -171,6 +171,8 @@ Run workflow executions asynchronously and safely.
 - Bounded goroutine execution with `context.Context`
 - Cancellation handling
 - Crash recovery behavior
+- Step executor `EVENT_PUBLISH` (publish ke message queue / gRPC) — lihat `design_event_driven_steps.md` kasus C
+- **Observability**: counter (run dibuat/selesai/gagal, step per status, retry) dan histogram (durasi step, kedalaman antrian, umur run), semuanya berlabel `tenant_id`
 
 ### Done When
 
@@ -179,6 +181,7 @@ Run workflow executions asynchronously and safely.
 - HTTP requests are validated against SSRF protection rules.
 - Goroutine lifecycle is bounded and cancelable.
 - Worker restart does not corrupt execution state.
+- Antrian yang menumpuk, step yang retry berulang, dan run yang macet terlihat di metrik — bukan hanya dari laporan pengguna.
 
 ---
 
@@ -199,6 +202,7 @@ Expose lifecycle-based execution actions through the API.
 - Get step details
 - List execution logs
 - AI analysis endpoint for failed runs
+- Trigger dari message queue / gRPC (`trigger_type` = `queue` / `grpc`) — listener tipis yang memanggil use case pembuat run yang sama; lihat `design_event_driven_steps.md` kasus A
 
 ### Done When
 
@@ -208,7 +212,36 @@ Expose lifecycle-based execution actions through the API.
 
 ---
 
-## Phase 7 — Real-Time Monitoring
+## Phase 7 — Event-Driven Steps
+
+### Goal
+
+Memungkinkan sebuah workflow berhenti di tengah jalan untuk menunggu event eksternal, lalu melanjutkan saat event itu datang.
+
+Desain lengkap: `.agents/plans/design_event_driven_steps.md` (kasus B).
+
+### Scope
+
+- Node type `EVENT_WAIT`
+- Tabel `step_wait_tokens` — korelasi event ke run yang menunggu, `UNIQUE (tenant_id, correlation_key)`
+- **Outbox** (`outbox_messages`) + relay publisher — jaminan pesan terkirim
+- **Inbox** (`inbox_messages`) — jaminan pesan tidak diproses ganda
+- Listener (consumer queue / gRPC server) yang membangunkan run
+- Sweeper timeout untuk token kadaluarsa
+- Dead-letter untuk event yatim + metrik `orphan_events_total`
+- Batas jumlah run menunggu per tenant
+
+### Done When
+
+- Sebuah run bisa berstatus `waiting` tanpa menahan goroutine worker.
+- Event yang datang membangunkan run yang benar, dan hanya sekali meski dikirim ulang.
+- Pesan dan wait token ditulis atomik — worker crash tidak menghasilkan run yang menunggu pesan yang tak pernah terkirim.
+- Event yang tidak cocok dengan token mana pun masuk dead-letter dan terlihat di metrik, tidak hilang diam-diam.
+- Token yang kadaluarsa membawa run ke jalur error, bukan menggantung selamanya.
+
+---
+
+## Phase 8 — Real-Time Monitoring
 
 ### Goal
 
@@ -233,7 +266,7 @@ Show workflow execution progress live.
 
 ---
 
-## Phase 8 — Workflow Builder Frontend
+## Phase 9 — Workflow Builder Frontend
 
 ### Goal
 
@@ -256,7 +289,7 @@ Provide a usable UI for workflow creation and management.
 
 ---
 
-## Phase 9 — Execution Monitoring Frontend
+## Phase 10 — Execution Monitoring Frontend
 
 ### Goal
 
@@ -279,7 +312,7 @@ Provide a clear visual experience for workflow runs.
 
 ---
 
-## Phase 10 — AI Feature
+## Phase 11 — AI Feature
 
 ### Goal
 
@@ -300,7 +333,7 @@ Add one meaningful AI-powered feature.
 
 ---
 
-## Phase 11 — Testing and Reliability
+## Phase 12 — Testing and Reliability
 
 ### Goal
 
@@ -323,7 +356,7 @@ Prove the system behaves correctly under normal and concurrent use.
 
 ---
 
-## Phase 12 — CI, Documentation, and Portfolio Polish
+## Phase 13 — CI, Documentation, and Portfolio Polish
 
 ### Goal
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"flowforge/internal/platform/logger"
 	"flowforge/internal/platform/postgres"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,17 +28,24 @@ func TestContextTxHelpers(t *testing.T) {
 }
 
 func getTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+
+	if os.Getenv("FLOWFORGE_INTEGRATION") == "" {
+		t.Skip("integration test dilewati — set FLOWFORGE_INTEGRATION=1 untuk menjalankan (butuh `make up`)")
+	}
+
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		dbURL = "postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	pool, err := postgres.NewPool(ctx, dbURL)
 	if err != nil {
-		t.Skipf("skipping live database test: %v", err)
+		t.Fatalf("FLOWFORGE_INTEGRATION=1 tetapi tidak bisa terhubung ke %s: %v",
+			logger.RedactURL(dbURL), err)
 	}
 	return pool
 }

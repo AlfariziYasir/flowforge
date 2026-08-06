@@ -4,7 +4,7 @@ package mocks
 
 import (
 	context "context"
-	workflow "flowforge/internal/workflow"
+	domain "flowforge/internal/domain"
 
 	mock "github.com/stretchr/testify/mock"
 )
@@ -23,7 +23,7 @@ func (_m *MockAuditRepository) EXPECT() *MockAuditRepository_Expecter {
 }
 
 // Record provides a mock function with given fields: ctx, e
-func (_m *MockAuditRepository) Record(ctx context.Context, e workflow.AuditEntry) error {
+func (_m *MockAuditRepository) Record(ctx context.Context, e domain.AuditEntry) error {
 	ret := _m.Called(ctx, e)
 
 	if len(ret) == 0 {
@@ -31,7 +31,7 @@ func (_m *MockAuditRepository) Record(ctx context.Context, e workflow.AuditEntry
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, workflow.AuditEntry) error); ok {
+	if rf, ok := ret.Get(0).(func(context.Context, domain.AuditEntry) error); ok {
 		r0 = rf(ctx, e)
 	} else {
 		r0 = ret.Error(0)
@@ -47,14 +47,14 @@ type MockAuditRepository_Record_Call struct {
 
 // Record is a helper method to define mock.On call
 //   - ctx context.Context
-//   - e workflow.AuditEntry
+//   - e domain.AuditEntry
 func (_e *MockAuditRepository_Expecter) Record(ctx interface{}, e interface{}) *MockAuditRepository_Record_Call {
 	return &MockAuditRepository_Record_Call{Call: _e.mock.On("Record", ctx, e)}
 }
 
-func (_c *MockAuditRepository_Record_Call) Run(run func(ctx context.Context, e workflow.AuditEntry)) *MockAuditRepository_Record_Call {
+func (_c *MockAuditRepository_Record_Call) Run(run func(ctx context.Context, e domain.AuditEntry)) *MockAuditRepository_Record_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(workflow.AuditEntry))
+		run(args[0].(context.Context), args[1].(domain.AuditEntry))
 	})
 	return _c
 }
@@ -64,7 +64,7 @@ func (_c *MockAuditRepository_Record_Call) Return(_a0 error) *MockAuditRepositor
 	return _c
 }
 
-func (_c *MockAuditRepository_Record_Call) RunAndReturn(run func(context.Context, workflow.AuditEntry) error) *MockAuditRepository_Record_Call {
+func (_c *MockAuditRepository_Record_Call) RunAndReturn(run func(context.Context, domain.AuditEntry) error) *MockAuditRepository_Record_Call {
 	_c.Call.Return(run)
 	return _c
 }

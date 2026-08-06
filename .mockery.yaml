@@ -1,5 +1,11 @@
 with-expecter: true
 packages:
+  flowforge/internal/domain:
+    config:
+      dir: "internal/domain/mocks"
+      outpkg: "mocks"
+    interfaces:
+      AuditRepository:
   flowforge/internal/auth:
     config:
       dir: "internal/auth/mocks"
@@ -26,5 +32,4 @@ packages:
     interfaces:
       WorkflowRepository:
       VersionRepository:
-      AuditRepository:
       WorkflowUseCase:

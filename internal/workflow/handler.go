@@ -262,6 +262,8 @@ func (h *WorkflowHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.Graph.Normalize()
+
 	draftVer, err := h.useCase.SaveDraft(r.Context(), SaveDraftCommand{
 		TenantID:   authUser.TenantID,
 		ActorID:    authUser.ID,

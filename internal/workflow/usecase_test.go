@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"flowforge/internal/domain"
+	domainmocks "flowforge/internal/domain/mocks"
 	"flowforge/internal/workflow"
 	workflowmocks "flowforge/internal/workflow/mocks"
 )
@@ -45,7 +46,7 @@ func TestCreateWorkflow(t *testing.T) {
 	t.Run("successfully creates workflow and draft version 1", func(t *testing.T) {
 		wfRepo := workflowmocks.NewMockWorkflowRepository(t)
 		verRepo := workflowmocks.NewMockVersionRepository(t)
-		auditRepo := workflowmocks.NewMockAuditRepository(t)
+		auditRepo := domainmocks.NewMockAuditRepository(t)
 		txRunner := &recordingTxRunner{}
 
 		wfRepo.EXPECT().Create(mock.Anything, mock.MatchedBy(func(wf *domain.Workflow) bool {
@@ -56,7 +57,7 @@ func TestCreateWorkflow(t *testing.T) {
 			return ver.VersionNumber == 1 && ver.Status == domain.VersionStatusDraft && ver.TenantID == tenantID
 		})).Return(nil)
 
-		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e workflow.AuditEntry) bool {
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
 			return e.Action == workflow.ActionWorkflowCreated && e.TenantID == tenantID
 		})).Return(nil)
 
@@ -90,7 +91,7 @@ func TestCreateWorkflow(t *testing.T) {
 	t.Run("returns conflict when name already exists", func(t *testing.T) {
 		wfRepo := workflowmocks.NewMockWorkflowRepository(t)
 		verRepo := workflowmocks.NewMockVersionRepository(t)
-		auditRepo := workflowmocks.NewMockAuditRepository(t)
+		auditRepo := domainmocks.NewMockAuditRepository(t)
 
 		wfRepo.EXPECT().Create(mock.Anything, mock.Anything).Return(workflow.ErrWorkflowAlreadyExists)
 
@@ -159,7 +160,7 @@ func TestUpdateWorkflow(t *testing.T) {
 
 	t.Run("updates metadata successfully", func(t *testing.T) {
 		wfRepo := workflowmocks.NewMockWorkflowRepository(t)
-		auditRepo := workflowmocks.NewMockAuditRepository(t)
+		auditRepo := domainmocks.NewMockAuditRepository(t)
 
 		existing := &domain.Workflow{
 			ID:          wfID,
@@ -174,7 +175,7 @@ func TestUpdateWorkflow(t *testing.T) {
 		wfRepo.EXPECT().UpdateMetadata(mock.Anything, mock.MatchedBy(func(wf *domain.Workflow) bool {
 			return wf.Name == "New Name"
 		}), 1).Return(nil)
-		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e workflow.AuditEntry) bool {
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
 			return e.Action == workflow.ActionWorkflowUpdated
 		})).Return(nil)
 
@@ -226,7 +227,7 @@ func TestArchiveWorkflow(t *testing.T) {
 	wfID := uuid.New()
 
 	wfRepo := workflowmocks.NewMockWorkflowRepository(t)
-	auditRepo := workflowmocks.NewMockAuditRepository(t)
+	auditRepo := domainmocks.NewMockAuditRepository(t)
 
 	existing := &domain.Workflow{
 		ID:         wfID,
@@ -237,7 +238,7 @@ func TestArchiveWorkflow(t *testing.T) {
 
 	wfRepo.EXPECT().FindByID(mock.Anything, tenantID, wfID).Return(existing, nil)
 	wfRepo.EXPECT().UpdateStatus(mock.Anything, tenantID, wfID, domain.WorkflowStatusArchived, 2).Return(nil)
-	auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e workflow.AuditEntry) bool {
+	auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
 		return e.Action == workflow.ActionWorkflowArchived
 	})).Return(nil)
 
@@ -272,13 +273,13 @@ func TestSaveDraft(t *testing.T) {
 	t.Run("saves valid draft successfully and returns bumped rowVersion", func(t *testing.T) {
 		wfRepo := workflowmocks.NewMockWorkflowRepository(t)
 		verRepo := workflowmocks.NewMockVersionRepository(t)
-		auditRepo := workflowmocks.NewMockAuditRepository(t)
+		auditRepo := domainmocks.NewMockAuditRepository(t)
 
 		wfRepo.EXPECT().FindByIDForUpdate(mock.Anything, tenantID, wfID).Return(&domain.Workflow{ID: wfID, Status: domain.WorkflowStatusDraft, RowVersion: 1}, nil)
 		wfRepo.EXPECT().TouchRowVersion(mock.Anything, tenantID, wfID, 1).Return(nil)
 		verRepo.EXPECT().FindDraftVersion(mock.Anything, tenantID, wfID).Return(&domain.WorkflowVersion{ID: draftVerID, VersionNumber: 1, Status: domain.VersionStatusDraft}, nil)
 		verRepo.EXPECT().ReplaceGraph(mock.Anything, tenantID, draftVerID, mock.Anything, mock.Anything).Return(nil)
-		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e workflow.AuditEntry) bool {
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
 			return e.Action == workflow.ActionWorkflowDraftSaved || e.Action == "draft_save"
 		})).Return(nil)
 
@@ -300,7 +301,7 @@ func TestSaveDraft(t *testing.T) {
 	t.Run("two sequential saves succeed when chaining rowVersion", func(t *testing.T) {
 		wfRepo := workflowmocks.NewMockWorkflowRepository(t)
 		verRepo := workflowmocks.NewMockVersionRepository(t)
-		auditRepo := workflowmocks.NewMockAuditRepository(t)
+		auditRepo := domainmocks.NewMockAuditRepository(t)
 
 		// First save at RowVersion 1
 		wfRepo.EXPECT().FindByIDForUpdate(mock.Anything, tenantID, wfID).Return(&domain.Workflow{ID: wfID, Status: domain.WorkflowStatusDraft, RowVersion: 1}, nil).Once()
@@ -419,7 +420,7 @@ func TestPublishVersion(t *testing.T) {
 	t.Run("publishes draft and clones new draft version 2", func(t *testing.T) {
 		wfRepo := workflowmocks.NewMockWorkflowRepository(t)
 		verRepo := workflowmocks.NewMockVersionRepository(t)
-		auditRepo := workflowmocks.NewMockAuditRepository(t)
+		auditRepo := domainmocks.NewMockAuditRepository(t)
 
 		wf := &domain.Workflow{ID: wfID, TenantID: tenantID, Status: domain.WorkflowStatusDraft, RowVersion: 1}
 		draftVer := &domain.WorkflowVersion{ID: draftVerID, TenantID: tenantID, WorkflowID: wfID, VersionNumber: 1, Status: domain.VersionStatusDraft}
@@ -433,7 +434,7 @@ func TestPublishVersion(t *testing.T) {
 			return v.VersionNumber == 2 && v.Status == domain.VersionStatusDraft
 		})).Return(nil)
 		verRepo.EXPECT().ReplaceGraph(mock.Anything, tenantID, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e workflow.AuditEntry) bool {
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
 			return e.Action == workflow.ActionWorkflowPublished
 		})).Return(nil)
 
@@ -529,7 +530,7 @@ func TestRollbackVersion(t *testing.T) {
 
 	wfRepo := workflowmocks.NewMockWorkflowRepository(t)
 	verRepo := workflowmocks.NewMockVersionRepository(t)
-	auditRepo := workflowmocks.NewMockAuditRepository(t)
+	auditRepo := domainmocks.NewMockAuditRepository(t)
 
 	wf := &domain.Workflow{ID: wfID, TenantID: tenantID, Status: domain.WorkflowStatusPublished, RowVersion: 3}
 	targetVer := &domain.WorkflowVersion{
@@ -562,7 +563,7 @@ func TestRollbackVersion(t *testing.T) {
 	verRepo.EXPECT().ReplaceGraph(mock.Anything, tenantID, mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
 	wfRepo.EXPECT().SetCurrentVersion(mock.Anything, tenantID, wfID, mock.Anything, 4, 3).Return(nil)
 	verRepo.EXPECT().FindDraftVersion(mock.Anything, tenantID, wfID).Return(draftVer, nil)
-	auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e workflow.AuditEntry) bool {
+	auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
 		return e.Action == workflow.ActionWorkflowRolledBack
 	})).Return(nil)
 
@@ -636,7 +637,7 @@ func TestPublishVersion_ChecksumStability(t *testing.T) {
 	t.Run("shuffled nodes and edges produce identical checksum", func(t *testing.T) {
 		wfRepo := workflowmocks.NewMockWorkflowRepository(t)
 		verRepo := workflowmocks.NewMockVersionRepository(t)
-		auditRepo := workflowmocks.NewMockAuditRepository(t)
+		auditRepo := domainmocks.NewMockAuditRepository(t)
 
 		wf := &domain.Workflow{ID: wfID, TenantID: tenantID, Status: domain.WorkflowStatusDraft, RowVersion: 1}
 		draftVer := &domain.WorkflowVersion{ID: draftVerID, TenantID: tenantID, WorkflowID: wfID, VersionNumber: 1, Status: domain.VersionStatusDraft}
@@ -728,6 +729,62 @@ func TestGetVersion_DraftAssemblesGraphFromLoadGraph(t *testing.T) {
 	assert.Equal(t, draftVer, detail.Version)
 	assert.Len(t, detail.Graph.Nodes, 1)
 	assert.Equal(t, "step1", detail.Graph.Nodes[0].NodeKey)
+}
+
+// W-4: GetVersion on a published version reads graph_snapshot, not LoadGraph.
+// No LoadGraph expectation is registered: if the use case reached for it, the
+// mock fails the test. The snapshot is deliberately the only source of truth.
+func TestGetVersion_PublishedReadsSnapshot(t *testing.T) {
+	tenantID := uuid.New()
+	wfID := uuid.New()
+	verID := uuid.New()
+
+	verRepo := workflowmocks.NewMockVersionRepository(t)
+
+	pubVer := &domain.WorkflowVersion{
+		ID:            verID,
+		TenantID:      tenantID,
+		WorkflowID:    wfID,
+		VersionNumber: 2,
+		Status:        domain.VersionStatusPublished,
+		GraphSnapshot: json.RawMessage(`{"nodes":[{"nodeKey":"snap","nodeType":"HTTP"}]}`),
+	}
+
+	verRepo.EXPECT().FindVersionByID(mock.Anything, tenantID, wfID, verID).Return(pubVer, nil)
+
+	uc := workflow.NewWorkflowUseCase(nil, verRepo, nil, &recordingTxRunner{})
+
+	detail, err := uc.GetVersion(context.Background(), tenantID, wfID, verID)
+	require.NoError(t, err)
+	require.Len(t, detail.Graph.Nodes, 1)
+	assert.Equal(t, "snap", detail.Graph.Nodes[0].NodeKey, "published version must read the snapshot")
+}
+
+// W-4 / B-6: a snapshot whose edges carry no branch key normalises to "default".
+func TestGetVersion_PublishedSnapshotNormalizesBranches(t *testing.T) {
+	tenantID := uuid.New()
+	wfID := uuid.New()
+	verID := uuid.New()
+
+	verRepo := workflowmocks.NewMockVersionRepository(t)
+
+	pubVer := &domain.WorkflowVersion{
+		ID:            verID,
+		TenantID:      tenantID,
+		WorkflowID:    wfID,
+		VersionNumber: 3,
+		Status:        domain.VersionStatusPublished,
+		GraphSnapshot: json.RawMessage(`{"nodes":[{"nodeKey":"start","nodeType":"HTTP"},{"nodeKey":"next","nodeType":"HTTP"}],"edges":[{"from":"start","to":"next"}]}`),
+	}
+
+	verRepo.EXPECT().FindVersionByID(mock.Anything, tenantID, wfID, verID).Return(pubVer, nil)
+
+	uc := workflow.NewWorkflowUseCase(nil, verRepo, nil, &recordingTxRunner{})
+
+	detail, err := uc.GetVersion(context.Background(), tenantID, wfID, verID)
+	require.NoError(t, err)
+	require.Len(t, detail.Graph.Edges, 1)
+	assert.Equal(t, "default", detail.Graph.Edges[0].Branch)
 }
 
 // T-33 is covered by the auditRepo.EXPECT().Record(..., MatchedBy(e.Action == ...))

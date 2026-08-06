@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,15 +14,23 @@ import (
 	"time"
 
 	"flowforge/internal/auth"
+	"flowforge/internal/execution"
+	"flowforge/internal/platform/ai"
+	"flowforge/internal/platform/audit"
 	"flowforge/internal/platform/config"
+	"flowforge/internal/platform/eventbus"
+	"flowforge/internal/platform/eventbus/eventspb"
 	"flowforge/internal/platform/logger"
 	"flowforge/internal/platform/postgres"
+	"flowforge/internal/platform/queue"
 	"flowforge/internal/platform/redis"
 	"flowforge/internal/tenant"
 	"flowforge/internal/workflow"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	redisclient "github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
 )
 
 // Pinger abstracts active connection checks for dependencies like PostgreSQL and Redis.
@@ -116,6 +125,7 @@ func NewRouter(
 	authHandler *auth.AuthHandler,
 	userHandler *auth.UserHandler,
 	workflowHandler *workflow.WorkflowHandler,
+	executionHandler *execution.ExecutionHandler,
 	authMiddleware *auth.AuthMiddleware,
 ) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -155,6 +165,23 @@ func NewRouter(
 		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/{versionId}/rollback", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Rollback))))
 		mux.Handle("GET /api/v1/workflows/{workflowId}/versions", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.ListVersions))))
 		mux.Handle("GET /api/v1/workflows/{workflowId}/versions/{versionId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.GetVersion))))
+	}
+
+	if executionHandler != nil && authMiddleware != nil {
+		mux.Handle("POST /api/v1/workflows/{workflowId}/runs", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.TriggerRun))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/runs", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListRuns))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.GetRun))))
+		mux.Handle("POST /api/v1/workflow-runs/{runId}/cancel", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.CancelRun))))
+		mux.Handle("POST /api/v1/workflow-runs/{runId}/retry", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.RetryRun))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}/steps", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListSteps))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}/steps/{stepRunId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.GetStep))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}/logs", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListLogs))))
+		mux.Handle("POST /api/v1/workflow-runs/{runId}/analysis", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.AnalyzeRun))))
+
+		// Event ingress is authenticated by HMAC, not JWT — external systems have
+		// no user session. Secret rotation stays behind the admin role.
+		mux.HandleFunc("POST /api/v1/tenants/{tenantId}/events", executionHandler.IngestEvent)
+		mux.Handle("POST /api/v1/tenants/{tenantId}/webhook-secret/rotate", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(executionHandler.RotateWebhookSecret))))
 	}
 
 	return mux
@@ -230,6 +257,8 @@ func main() {
 	var authHandler *auth.AuthHandler
 	var userHandler *auth.UserHandler
 	var workflowHandler *workflow.WorkflowHandler
+	var executionHandler *execution.ExecutionHandler
+	var grpcSrv *grpc.Server
 	var authMiddleware *auth.AuthMiddleware
 
 	if dbPool != nil {
@@ -257,8 +286,36 @@ func main() {
 
 		wfRepo := workflow.NewWorkflowRepository(dbPool)
 		verRepo := workflow.NewVersionRepository(dbPool)
-		auditRepo := workflow.NewAuditRepository(dbPool)
+		auditRepo := audit.NewAuditRepository(dbPool)
 		wfUC := workflow.NewWorkflowUseCase(wfRepo, verRepo, auditRepo, uow)
+
+		execRepo := execution.NewExecutionRepository(dbPool)
+		if rClient != nil {
+			queueClient := queue.NewClient(rClient)
+			defer queueClient.Close()
+			aiProvider := ai.NewDeepSeekProvider(ai.Config{
+				APIKey:         cfg.AIProviderAPIKey,
+				Model:          cfg.AIModel,
+				BaseURL:        cfg.AIBaseURL,
+				RequestTimeout: cfg.AIRequestTimeout,
+			})
+			// wfUC satisfies WorkflowReader (GetWorkflow); verRepo satisfies
+			// execution.GraphLoader structurally (LoadGraph) — zero new instances.
+			execUC := execution.NewExecutionUseCase(
+				wfUC, execRepo, execRepo, execRepo, verRepo, queueClient, auditRepo, uow, aiProvider, execRepo,
+				execution.ExecutionConfig{AIMaxRetries: cfg.AIMaxRetries, AIRequestTimeout: cfg.AIRequestTimeout, Logger: log},
+			)
+			executionHandler = execution.NewExecutionHandler(execUC)
+
+			// Phase 7 gRPC event ingress: a second listener on GRPC_PORT sharing
+			// the same use-case instance. Auth is the shared webhookauth HMAC
+			// interceptor, not JWT.
+			secretGetter := func(ctx context.Context, tenantID uuid.UUID) (string, error) {
+				return execRepo.GetWebhookSecret(ctx, tenantID)
+			}
+			grpcSrv = grpc.NewServer(grpc.UnaryInterceptor(eventbus.AuthInterceptor(secretGetter)))
+			eventspb.RegisterEventListenerServer(grpcSrv, eventbus.NewEventListenerServer(execUC))
+		}
 
 		authHandler = auth.NewAuthHandlerWithTrustProxy(authUC, cfg.TrustProxyHeaders)
 		userHandler = auth.NewUserHandler(userUC)
@@ -266,7 +323,7 @@ func main() {
 		authMiddleware = auth.NewAuthMiddlewareWithSessionStore(jwtSvc, blacklist, sessionStore)
 	}
 
-	router := NewRouter(hc, authHandler, userHandler, workflowHandler, authMiddleware)
+	router := NewRouter(hc, authHandler, userHandler, workflowHandler, executionHandler, authMiddleware)
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
 		Handler:      router,
@@ -282,6 +339,23 @@ func main() {
 		}
 	}()
 
+	// Phase 7 gRPC event ingress on a second listener, owned by the same signal
+	// handler and drained on shutdown.
+	if grpcSrv != nil {
+		go func() {
+			lis, err := net.Listen("tcp", ":"+cfg.GRPCPort)
+			if err != nil {
+				log.Error("failed to start gRPC listener", slog.Any("error", err))
+				serverErr <- err
+				return
+			}
+			log.Info("Starting FlowForge gRPC event listener", slog.String("port", cfg.GRPCPort))
+			if err := grpcSrv.Serve(lis); err != nil {
+				log.Error("gRPC server failed", slog.Any("error", err))
+			}
+		}()
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -293,6 +367,9 @@ func main() {
 	}
 
 	log.Info("Shutting down API server gracefully...")
+	if grpcSrv != nil {
+		grpcSrv.GracefulStop()
+	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 

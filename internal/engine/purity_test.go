@@ -16,6 +16,8 @@ import (
 // Phase 4's executor relies on.
 var forbiddenImports = []string{
 	"net/http",
+	"net",
+	"os/exec",
 	"database/sql",
 	"github.com/jackc/pgx",
 	"github.com/redis/go-redis",
@@ -28,6 +30,11 @@ var forbiddenImports = []string{
 // allowedPrefixes are the only non-stdlib imports the engine may use.
 var allowedPrefixes = []string{
 	"flowforge/internal/domain",
+	// expr-lang is a pure in-memory expression evaluator: no I/O, no host
+	// reflection, no network. Allowed because CONDITION/TRANSFORM need sandboxed
+	// evaluation and hand-rolling one would be worse. Anything else added here
+	// needs the same justification in writing.
+	"github.com/expr-lang/expr",
 }
 
 // T-26: the engine's purity contract, enforced mechanically rather than by review.

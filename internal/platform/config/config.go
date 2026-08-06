@@ -18,6 +18,20 @@ type Config struct {
 	JWTAccessExpiry   time.Duration
 	JWTRefreshExpiry  time.Duration
 	TrustProxyHeaders bool
+
+	WorkerConcurrency int
+	RunLeaseDuration  time.Duration
+	StepMaxBodyBytes  int64
+
+	AIProviderAPIKey string
+	AIModel          string
+	AIBaseURL        string
+	AIRequestTimeout time.Duration
+	AIMaxRetries     int
+
+	GRPCPort   string
+	NATSURL    string
+	NATSStream string
 }
 
 // Load populates configuration from environment variables with fallback defaults.
@@ -28,12 +42,35 @@ func Load() *Config {
 		DatabaseURL:       getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"),
 		RedisURL:          getEnv("REDIS_URL", "redis://localhost:6379"),
 		LogLevel:          getEnv("LOG_LEVEL", "info"),
-		AllowedHTTP:       getEnv("ALLOWED_HTTP_HOSTS", "httpbin.org,localhost,127.0.0.1"),
+		AllowedHTTP:       getEnv("ALLOWED_HTTP_HOSTS", ""),
 		JWTSecret:         getEnv("JWT_SECRET", ""),
 		JWTAccessExpiry:   getEnvDuration("JWT_ACCESS_EXPIRY", 15*time.Minute),
 		JWTRefreshExpiry:  getEnvDuration("JWT_REFRESH_EXPIRY", 7*24*time.Hour),
 		TrustProxyHeaders: getEnvBool("TRUST_PROXY_HEADERS", false),
+
+		WorkerConcurrency: getEnvInt("WORKER_CONCURRENCY", 10),
+		RunLeaseDuration:  getEnvDuration("RUN_LEASE_DURATION", 60*time.Second),
+		StepMaxBodyBytes:  getEnvInt64("STEP_MAX_BODY_BYTES", 1<<20),
+
+		AIProviderAPIKey: getEnv("AI_PROVIDER_API_KEY", ""),
+		AIModel:          getEnv("AI_MODEL", "deepseek-chat"),
+		AIBaseURL:        getEnv("AI_BASE_URL", "https://api.deepseek.com"),
+		AIRequestTimeout: getEnvDuration("AI_REQUEST_TIMEOUT", 30*time.Second),
+		AIMaxRetries:     getEnvInt("AI_MAX_RETRIES", 2),
+
+		GRPCPort:   getEnv("GRPC_PORT", "9090"),
+		NATSURL:    getEnv("NATS_URL", "nats://localhost:4222"),
+		NATSStream: getEnv("NATS_STREAM", "FLOWFORGE_EVENTS"),
 	}
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return i
+		}
+	}
+	return fallback
 }
 
 func getEnv(key, fallback string) string {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,6 +19,7 @@ var (
 )
 
 type CreateUserCommand struct {
+	ActorID  uuid.UUID `json:"-"`
 	TenantID uuid.UUID `json:"tenantId"`
 	Email    string    `json:"email"`
 	Password string    `json:"password"`
@@ -80,16 +82,30 @@ type userUseCase struct {
 	sessionStore  SessionStore
 	refreshExpiry time.Duration
 	txRunner      TxRunner
+	audit         domain.AuditRepository
+}
+
+// NewUserUseCase builds a default UserUseCase with passthrough transaction runner.
+func NewUserUseCase(userRepo UserRepository, passSvc PasswordService, sessionStore SessionStore, refreshExpiry time.Duration) UserUseCase {
+	return NewUserUseCaseWithTxAndAudit(userRepo, passSvc, sessionStore, refreshExpiry, NewPassthroughTxRunner(), nil)
 }
 
 // NewUserUseCaseWithTx builds a UserUseCase bound to a transaction boundary.
 // txRunner must not be nil — pass NewPassthroughTxRunner() to opt out explicitly.
 func NewUserUseCaseWithTx(userRepo UserRepository, passSvc PasswordService, sessionStore SessionStore, refreshExpiry time.Duration, txRunner TxRunner) UserUseCase {
+	return NewUserUseCaseWithTxAndAudit(userRepo, passSvc, sessionStore, refreshExpiry, txRunner, nil)
+}
+
+// NewUserUseCaseWithTxAndAudit builds a UserUseCase with transaction and audit logging capabilities.
+func NewUserUseCaseWithTxAndAudit(userRepo UserRepository, passSvc PasswordService, sessionStore SessionStore, refreshExpiry time.Duration, txRunner TxRunner, audit domain.AuditRepository) UserUseCase {
 	if refreshExpiry <= 0 {
 		refreshExpiry = 7 * 24 * time.Hour
 	}
 	if sessionStore == nil {
 		sessionStore = NewNoopSessionStore()
+	}
+	if txRunner == nil {
+		txRunner = NewPassthroughTxRunner()
 	}
 	return &userUseCase{
 		userRepo:      userRepo,
@@ -97,6 +113,7 @@ func NewUserUseCaseWithTx(userRepo UserRepository, passSvc PasswordService, sess
 		sessionStore:  sessionStore,
 		refreshExpiry: refreshExpiry,
 		txRunner:      txRunner,
+		audit:         audit,
 	}
 }
 
@@ -139,7 +156,33 @@ func (u *userUseCase) CreateUser(ctx context.Context, cmd CreateUserCommand) (*d
 		IsActive:     true,
 	}
 
-	if err := u.userRepo.CreateUser(ctx, usr); err != nil {
+	err = u.txRunner.ExecuteInTx(ctx, func(txCtx context.Context) error {
+		if err := u.userRepo.CreateUser(txCtx, usr); err != nil {
+			return err
+		}
+		if u.audit != nil {
+			actorID := cmd.ActorID
+			if actorID == uuid.Nil {
+				actorID = usr.ID
+			}
+			meta, _ := json.Marshal(map[string]string{
+				"email": usr.Email,
+				"role":  usr.Role,
+			})
+			if err := u.audit.Record(txCtx, domain.AuditEntry{
+				TenantID:    usr.TenantID,
+				ActorUserID: &actorID,
+				Action:      ActionUserCreated,
+				EntityType:  "user",
+				EntityID:    &usr.ID,
+				Metadata:    meta,
+			}); err != nil {
+				return fmt.Errorf("audit user creation: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -232,6 +275,27 @@ func (u *userUseCase) UpdateUser(ctx context.Context, cmd UpdateUserCommand) (*d
 		if deactivating || roleChanged {
 			if err := u.revokeUserAccess(txCtx, usr.TenantID, usr.ID); err != nil {
 				return fmt.Errorf("revoke user access on update: %w", err)
+			}
+		}
+		if u.audit != nil {
+			meta, _ := json.Marshal(map[string]any{
+				"email":    usr.Email,
+				"role":     usr.Role,
+				"isActive": usr.IsActive,
+			})
+			actorID := cmd.ActorID
+			if actorID == uuid.Nil {
+				actorID = usr.ID
+			}
+			if err := u.audit.Record(txCtx, domain.AuditEntry{
+				TenantID:    usr.TenantID,
+				ActorUserID: &actorID,
+				Action:      ActionUserUpdated,
+				EntityType:  "user",
+				EntityID:    &usr.ID,
+				Metadata:    meta,
+			}); err != nil {
+				return fmt.Errorf("audit user update: %w", err)
 			}
 		}
 		return nil

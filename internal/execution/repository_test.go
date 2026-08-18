@@ -566,7 +566,13 @@ func TestSweeper_AdvancesPastAlreadyHandledExpiredTokens(t *testing.T) {
 
 	tenantID, wfID, verID, nodes := seedRunFixtures(t, ctx, pool, 1)
 
-	// Seed 105 expired tokens whose steps were ALREADY marked failed (already handled)
+	// Clean up any leftover wait tokens from prior test runs for full test isolation
+	_, err := pool.Exec(ctx, `DELETE FROM step_wait_tokens`)
+	require.NoError(t, err)
+
+	// Seed 105 expired, genuinely UNHANDLED tokens — no direct MarkTokenHandled
+	// call. Their ExpiresAt is earlier than the active token's, so ORDER BY
+	// expires_at puts them first in FindExpiredTokens.
 	for i := 0; i < 105; i++ {
 		run := &domain.WorkflowRun{ID: uuid.New(), TenantID: tenantID, WorkflowID: wfID, WorkflowVersionID: verID}
 		_, err := repo.CreateRun(ctx, run)
@@ -574,6 +580,9 @@ func TestSweeper_AdvancesPastAlreadyHandledExpiredTokens(t *testing.T) {
 		require.NoError(t, repo.CreateStepRuns(ctx, tenantID, run.ID, nodes))
 		steps, err := repo.ListStepRuns(ctx, tenantID, run.ID)
 		require.NoError(t, err)
+		_, err = pool.Exec(ctx, `UPDATE step_runs SET status='waiting' WHERE id=$1`, steps[0].ID)
+		require.NoError(t, err)
+		require.NoError(t, repo.UpdateRunStatus(ctx, tenantID, run.ID, domain.RunStatusWaiting, false))
 
 		token := &domain.StepWaitToken{
 			ID:             uuid.New(),
@@ -584,13 +593,11 @@ func TestSweeper_AdvancesPastAlreadyHandledExpiredTokens(t *testing.T) {
 			ExpiresAt:      time.Now().Add(-2 * time.Hour),
 		}
 		require.NoError(t, repo.CreateToken(ctx, token))
-		// Mark token handled (via sweep or MarkTokenHandled)
-		require.NoError(t, repo.MarkTokenHandled(ctx, tenantID, token.ID))
 	}
 
-	// Now seed 1 recently expired token whose step is genuinely waiting
+	// 1 more recently-expired token whose step is genuinely still waiting.
 	activeRun := &domain.WorkflowRun{ID: uuid.New(), TenantID: tenantID, WorkflowID: wfID, WorkflowVersionID: verID}
-	_, err := repo.CreateRun(ctx, activeRun)
+	_, err = repo.CreateRun(ctx, activeRun)
 	require.NoError(t, err)
 	require.NoError(t, repo.CreateStepRuns(ctx, tenantID, activeRun.ID, nodes))
 	steps, err := repo.ListStepRuns(ctx, tenantID, activeRun.ID)
@@ -609,15 +616,24 @@ func TestSweeper_AdvancesPastAlreadyHandledExpiredTokens(t *testing.T) {
 	}
 	require.NoError(t, repo.CreateToken(ctx, activeToken))
 
-	// Run sweeper
 	fakeEnq := &fakeEnqueuer{}
-	swept, err := execution.SweepExpiredWaitTokens(ctx, repo, repo, fakeEnq, nil)
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, swept, 1, "sweeper must make progress past handled tokens and sweep the active expired token")
 
-	// Verify activeRun status is now pending (woken)
+	// First sweep: FindExpiredTokens(limit=100) returns the 100 oldest of the
+	// 106 expired tokens — all backlog, none of them the active one (it's
+	// newest). The sweeper must mark all 100 handled itself; without the fix,
+	// nothing does, and they resurface forever.
+	swept1, err := execution.SweepExpiredWaitTokens(ctx, repo, repo, fakeEnq, nil)
+	require.NoError(t, err)
+	require.Equal(t, 100, swept1, "first sweep processes exactly the LIMIT")
+
+	// Second sweep: only reaches the remaining 5 backlog tokens plus the active
+	// one if the first sweep's 100 no longer resurface. This is the actual
+	// regression AB-2 diagnosed and the line this test must catch losing.
+	swept2, err := execution.SweepExpiredWaitTokens(ctx, repo, repo, fakeEnq, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 6, swept2, "second sweep must advance past the first 100 to reach the remaining backlog and the active token")
+
 	gotRun, err := repo.GetRun(ctx, tenantID, activeRun.ID)
 	require.NoError(t, err)
-	assert.Equal(t, domain.RunStatusPending, gotRun.Status)
+	assert.Equal(t, domain.RunStatusPending, gotRun.Status, "the active run must have been woken")
 }
-

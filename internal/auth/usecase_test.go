@@ -16,6 +16,7 @@ import (
 	"flowforge/internal/auth"
 	authmocks "flowforge/internal/auth/mocks"
 	"flowforge/internal/domain"
+	domainmocks "flowforge/internal/domain/mocks"
 	"flowforge/internal/tenant"
 	tenantmocks "flowforge/internal/tenant/mocks"
 )
@@ -91,6 +92,29 @@ func TestAuthUseCase_Login(t *testing.T) {
 		res, err := uc.Login(ctx, " DEFAULT-TENANT ", " ADMIN@FLOWFORGE.LOCAL ", "SecretP@ss123", "127.0.0.1", "curl/7.68.0")
 		req.NoError(err)
 		is.NotEmpty(res.AccessToken)
+	})
+
+	t.Run("successfully audits login event", func(t *testing.T) {
+		tenantUC := tenantmocks.NewMockTenantUseCase(t)
+		tenantUC.EXPECT().GetBySlug(mock.Anything, "default-tenant").Return(tnt, nil)
+
+		userRepo := authmocks.NewMockUserRepository(t)
+		userRepo.EXPECT().FindByEmail(mock.Anything, tnt.ID, "admin@flowforge.local").Return(user, nil)
+
+		jwtSvc := auth.NewJWTService("auth-uc-test-secret-key-32chars!!", 15*time.Minute, 7*24*time.Hour)
+		sessionStore := authmocks.NewMockSessionStore(t)
+		sessionStore.EXPECT().CreateSession(mock.Anything, mock.Anything, 7*24*time.Hour).Return(nil)
+
+		auditRepo := domainmocks.NewMockAuditRepository(t)
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
+			return e.TenantID == tnt.ID && e.ActorUserID != nil && *e.ActorUserID == user.ID && e.Action == auth.ActionUserLoggedIn && e.EntityType == "user" && *e.EntityID == user.ID
+		})).Return(nil).Once()
+
+		uc := auth.NewAuthUseCaseWithAudit(tenantUC, userRepo, jwtSvc, passSvc, nil, sessionStore, 7*24*time.Hour, auditRepo, nil)
+
+		res, err := uc.Login(ctx, "default-tenant", "admin@flowforge.local", "SecretP@ss123", "127.0.0.1", "curl/7.68.0")
+		require.NoError(t, err)
+		assert.NotEmpty(t, res.AccessToken)
 	})
 
 	t.Run("returns ErrUnauthorized on invalid password", func(t *testing.T) {

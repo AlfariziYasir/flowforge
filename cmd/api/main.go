@@ -20,15 +20,21 @@ import (
 	"flowforge/internal/platform/config"
 	"flowforge/internal/platform/eventbus"
 	"flowforge/internal/platform/eventbus/eventspb"
+	"flowforge/internal/platform/eventstream"
+	"flowforge/internal/platform/httpmw"
 	"flowforge/internal/platform/logger"
+	"flowforge/internal/platform/metrics"
 	"flowforge/internal/platform/postgres"
 	"flowforge/internal/platform/queue"
+	"flowforge/internal/platform/ratelimit"
 	"flowforge/internal/platform/redis"
 	"flowforge/internal/tenant"
 	"flowforge/internal/workflow"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	redisclient "github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 )
@@ -128,60 +134,103 @@ func NewRouter(
 	executionHandler *execution.ExecutionHandler,
 	authMiddleware *auth.AuthMiddleware,
 ) *http.ServeMux {
+	return NewRouterWithLimiter(hc, authHandler, userHandler, workflowHandler, executionHandler, authMiddleware, nil, nil, false)
+}
+
+// NewRouterWithLimiter registers HTTP routes with optional Prometheus metrics and Redis rate limiting.
+func NewRouterWithLimiter(
+	hc *HealthChecker,
+	authHandler *auth.AuthHandler,
+	userHandler *auth.UserHandler,
+	workflowHandler *workflow.WorkflowHandler,
+	executionHandler *execution.ExecutionHandler,
+	authMiddleware *auth.AuthMiddleware,
+	reg prometheus.Gatherer,
+	limiter *ratelimit.Limiter,
+	trustProxyHeaders bool,
+) *http.ServeMux {
 	mux := http.NewServeMux()
 	if hc != nil {
 		mux.Handle("/health", hc)
 		mux.Handle("/api/v1/health", hc)
 	}
 
+	if reg != nil {
+		mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	}
+
+	loginLimit := func(h http.Handler) http.Handler {
+		if limiter == nil {
+			return h
+		}
+		return ratelimit.Middleware(limiter, 10, time.Minute, ratelimit.IPKeyFunc("login", trustProxyHeaders))(h)
+	}
+
+	triggerRunLimit := func(h http.Handler) http.Handler {
+		if limiter == nil {
+			return h
+		}
+		return ratelimit.Middleware(limiter, 30, time.Minute, ratelimit.TenantKeyFunc("trigger_run"))(h)
+	}
+
+	generalLimit := func(h http.Handler) http.Handler {
+		if limiter == nil {
+			return h
+		}
+		return ratelimit.Middleware(limiter, 120, time.Minute, ratelimit.TenantKeyFunc("general"))(h)
+	}
+
 	if authHandler != nil {
-		mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+		mux.Handle("POST /api/v1/auth/login", loginLimit(http.HandlerFunc(authHandler.Login)))
 		mux.HandleFunc("POST /api/v1/auth/refresh", authHandler.Refresh)
 		mux.HandleFunc("POST /api/v1/auth/logout", authHandler.Logout)
 
 		if authMiddleware != nil {
-			mux.Handle("POST /api/v1/auth/logout-all", authMiddleware.Authenticate(http.HandlerFunc(authHandler.LogoutAll)))
-			mux.Handle("GET /api/v1/auth/sessions", authMiddleware.Authenticate(http.HandlerFunc(authHandler.ListSessions)))
-			mux.Handle("GET /api/v1/users/me", authMiddleware.Authenticate(http.HandlerFunc(authHandler.GetMe)))
+			mux.Handle("POST /api/v1/auth/logout-all", authMiddleware.Authenticate(generalLimit(http.HandlerFunc(authHandler.LogoutAll))))
+			mux.Handle("GET /api/v1/auth/sessions", authMiddleware.Authenticate(generalLimit(http.HandlerFunc(authHandler.ListSessions))))
+			mux.Handle("GET /api/v1/users/me", authMiddleware.Authenticate(generalLimit(http.HandlerFunc(authHandler.GetMe))))
 		}
 	}
 
 	if userHandler != nil && authMiddleware != nil {
-		mux.Handle("POST /api/v1/users", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.CreateUser))))
-		mux.Handle("GET /api/v1/users", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(userHandler.ListUsers))))
-		mux.Handle("GET /api/v1/users/{userId}", authMiddleware.Authenticate(http.HandlerFunc(userHandler.GetUser)))
-		mux.Handle("PATCH /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.UpdateUser))))
-		mux.Handle("DELETE /api/v1/users/{userId}", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(userHandler.DeleteUser))))
+		mux.Handle("POST /api/v1/users", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin")(http.HandlerFunc(userHandler.CreateUser)))))
+		mux.Handle("GET /api/v1/users", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(userHandler.ListUsers)))))
+		mux.Handle("GET /api/v1/users/{userId}", authMiddleware.Authenticate(generalLimit(http.HandlerFunc(userHandler.GetUser))))
+		mux.Handle("PATCH /api/v1/users/{userId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin")(http.HandlerFunc(userHandler.UpdateUser)))))
+		mux.Handle("DELETE /api/v1/users/{userId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin")(http.HandlerFunc(userHandler.DeleteUser)))))
 	}
 
 	if workflowHandler != nil && authMiddleware != nil {
-		mux.Handle("POST /api/v1/workflows", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Create))))
-		mux.Handle("GET /api/v1/workflows", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.List))))
-		mux.Handle("GET /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.Get))))
-		mux.Handle("PATCH /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Update))))
-		mux.Handle("DELETE /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Archive))))
-		mux.Handle("PUT /api/v1/workflows/{workflowId}/draft", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.SaveDraft))))
-		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/publish", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Publish))))
-		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/{versionId}/rollback", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Rollback))))
-		mux.Handle("GET /api/v1/workflows/{workflowId}/versions", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.ListVersions))))
-		mux.Handle("GET /api/v1/workflows/{workflowId}/versions/{versionId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.GetVersion))))
+		mux.Handle("POST /api/v1/workflows", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Create)))))
+		mux.Handle("GET /api/v1/workflows", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.List)))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.Get)))))
+		mux.Handle("PATCH /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Update)))))
+		mux.Handle("DELETE /api/v1/workflows/{workflowId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Archive)))))
+		mux.Handle("PUT /api/v1/workflows/{workflowId}/draft", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.SaveDraft)))))
+		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/publish", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Publish)))))
+		mux.Handle("POST /api/v1/workflows/{workflowId}/versions/{versionId}/rollback", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(workflowHandler.Rollback)))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/versions", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.ListVersions)))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/versions/{versionId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(workflowHandler.GetVersion)))))
 	}
 
 	if executionHandler != nil && authMiddleware != nil {
-		mux.Handle("POST /api/v1/workflows/{workflowId}/runs", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.TriggerRun))))
-		mux.Handle("GET /api/v1/workflows/{workflowId}/runs", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListRuns))))
-		mux.Handle("GET /api/v1/workflow-runs/{runId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.GetRun))))
-		mux.Handle("POST /api/v1/workflow-runs/{runId}/cancel", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.CancelRun))))
-		mux.Handle("POST /api/v1/workflow-runs/{runId}/retry", authMiddleware.Authenticate(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.RetryRun))))
-		mux.Handle("GET /api/v1/workflow-runs/{runId}/steps", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListSteps))))
-		mux.Handle("GET /api/v1/workflow-runs/{runId}/steps/{stepRunId}", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.GetStep))))
-		mux.Handle("GET /api/v1/workflow-runs/{runId}/logs", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListLogs))))
-		mux.Handle("POST /api/v1/workflow-runs/{runId}/analysis", authMiddleware.Authenticate(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.AnalyzeRun))))
+		mux.Handle("POST /api/v1/workflows/{workflowId}/runs", authMiddleware.Authenticate(triggerRunLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.TriggerRun)))))
+		mux.Handle("GET /api/v1/workflows/{workflowId}/runs", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListRuns)))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.GetRun)))))
+		mux.Handle("POST /api/v1/workflow-runs/{runId}/cancel", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.CancelRun)))))
+		mux.Handle("POST /api/v1/workflow-runs/{runId}/retry", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor")(http.HandlerFunc(executionHandler.RetryRun)))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}/steps", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListSteps)))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}/steps/{stepRunId}", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.GetStep)))))
+		mux.Handle("GET /api/v1/workflow-runs/{runId}/logs", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.ListLogs)))))
+		mux.Handle("POST /api/v1/workflow-runs/{runId}/analysis", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin", "editor", "viewer")(http.HandlerFunc(executionHandler.AnalyzeRun)))))
+
+		// Phase 8 Real-time Monitoring SSE stream (authenticated via header or ?token=)
+		mux.Handle("GET /api/v1/events", authMiddleware.AuthenticateWithTokenSource(true)(http.HandlerFunc(executionHandler.StreamEvents)))
 
 		// Event ingress is authenticated by HMAC, not JWT — external systems have
 		// no user session. Secret rotation stays behind the admin role.
 		mux.HandleFunc("POST /api/v1/tenants/{tenantId}/events", executionHandler.IngestEvent)
-		mux.Handle("POST /api/v1/tenants/{tenantId}/webhook-secret/rotate", authMiddleware.Authenticate(auth.RequireRole("admin")(http.HandlerFunc(executionHandler.RotateWebhookSecret))))
+		mux.Handle("POST /api/v1/tenants/{tenantId}/webhook-secret/rotate", authMiddleware.Authenticate(generalLimit(auth.RequireRole("admin")(http.HandlerFunc(executionHandler.RotateWebhookSecret)))))
 	}
 
 	return mux
@@ -261,6 +310,9 @@ func main() {
 	var grpcSrv *grpc.Server
 	var authMiddleware *auth.AuthMiddleware
 
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
 	if dbPool != nil {
 		tenantRepo := tenant.NewTenantRepository(dbPool)
 		userRepo := auth.NewUserRepository(dbPool)
@@ -279,14 +331,14 @@ func main() {
 
 		jwtSvc := auth.NewJWTService(jwtSecret, cfg.JWTAccessExpiry, cfg.JWTRefreshExpiry)
 		passSvc := auth.NewPasswordService()
+		auditRepo := audit.NewAuditRepository(dbPool)
 
 		tenantUC := tenant.NewTenantUseCase(tenantRepo)
-		authUC := auth.NewAuthUseCase(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, cfg.JWTRefreshExpiry)
-		userUC := auth.NewUserUseCaseWithTx(userRepo, passSvc, sessionStore, cfg.JWTRefreshExpiry, uow)
+		authUC := auth.NewAuthUseCaseWithAudit(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, cfg.JWTRefreshExpiry, auditRepo, log)
+		userUC := auth.NewUserUseCaseWithTxAndAudit(userRepo, passSvc, sessionStore, cfg.JWTRefreshExpiry, uow, auditRepo)
 
 		wfRepo := workflow.NewWorkflowRepository(dbPool)
 		verRepo := workflow.NewVersionRepository(dbPool)
-		auditRepo := audit.NewAuditRepository(dbPool)
 		wfUC := workflow.NewWorkflowUseCase(wfRepo, verRepo, auditRepo, uow)
 
 		execRepo := execution.NewExecutionRepository(dbPool)
@@ -299,13 +351,23 @@ func main() {
 				BaseURL:        cfg.AIBaseURL,
 				RequestTimeout: cfg.AIRequestTimeout,
 			})
+			eventPub := eventstream.NewRedisPublisher(rClient)
+			clientMgr := eventstream.NewClientManager(rClient, log)
+			defer func() { _ = clientMgr.Close() }()
+
 			// wfUC satisfies WorkflowReader (GetWorkflow); verRepo satisfies
 			// execution.GraphLoader structurally (LoadGraph) — zero new instances.
 			execUC := execution.NewExecutionUseCase(
 				wfUC, execRepo, execRepo, execRepo, verRepo, queueClient, auditRepo, uow, aiProvider, execRepo,
-				execution.ExecutionConfig{AIMaxRetries: cfg.AIMaxRetries, AIRequestTimeout: cfg.AIRequestTimeout, Logger: log},
+				execution.ExecutionConfig{
+					AIMaxRetries:     cfg.AIMaxRetries,
+					AIRequestTimeout: cfg.AIRequestTimeout,
+					Events:           eventPub,
+					Metrics:          m,
+					Logger:           log,
+				},
 			)
-			executionHandler = execution.NewExecutionHandler(execUC)
+			executionHandler = execution.NewExecutionHandlerWithStream(execUC, clientMgr, m)
 
 			// Phase 7 gRPC event ingress: a second listener on GRPC_PORT sharing
 			// the same use-case instance. Auth is the shared webhookauth HMAC
@@ -314,7 +376,7 @@ func main() {
 				return execRepo.GetWebhookSecret(ctx, tenantID)
 			}
 			grpcSrv = grpc.NewServer(grpc.UnaryInterceptor(eventbus.AuthInterceptor(secretGetter)))
-			eventspb.RegisterEventListenerServer(grpcSrv, eventbus.NewEventListenerServer(execUC))
+			eventspb.RegisterEventListenerServer(grpcSrv, eventbus.NewEventListenerServerWithTriggerer(execUC, execUC))
 		}
 
 		authHandler = auth.NewAuthHandlerWithTrustProxy(authUC, cfg.TrustProxyHeaders)
@@ -323,10 +385,22 @@ func main() {
 		authMiddleware = auth.NewAuthMiddlewareWithSessionStore(jwtSvc, blacklist, sessionStore)
 	}
 
-	router := NewRouter(hc, authHandler, userHandler, workflowHandler, executionHandler, authMiddleware)
+	var limiter *ratelimit.Limiter
+	if rClient != nil {
+		limiter = ratelimit.NewLimiter(rClient, log)
+	}
+
+	router := NewRouterWithLimiter(hc, authHandler, userHandler, workflowHandler, executionHandler, authMiddleware, reg, limiter, cfg.TrustProxyHeaders)
+
+	var handler http.Handler = router
+	if len(cfg.CORSAllowedOrigins) > 0 {
+		handler = httpmw.CORS(cfg.CORSAllowedOrigins, cfg.CORSAllowCredentials)(handler)
+	}
+	handler = httpmw.SecurityHeaders()(handler)
+
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      router,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}

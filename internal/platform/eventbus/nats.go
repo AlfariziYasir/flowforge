@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 
+	"flowforge/internal/execution"
 	"flowforge/internal/execution/executor"
 	"flowforge/internal/platform/webhookauth"
 )
@@ -65,6 +66,12 @@ func (p *NATSPublisher) Publish(ctx context.Context, in executor.PublishInput) e
 // a successful-but-unacked message is a safe no-op. Blocks until ctx is done.
 func Subscribe(ctx context.Context, nc *nats.Conn, subject, durableName string,
 	secret SecretGetter, handler EventHandler, logger *slog.Logger) error {
+	return SubscribeWithTriggerer(ctx, nc, subject, durableName, secret, handler, nil, logger)
+}
+
+// SubscribeWithTriggerer starts a durable JetStream consumer that supports both event delivery and run triggering.
+func SubscribeWithTriggerer(ctx context.Context, nc *nats.Conn, subject, durableName string,
+	secret SecretGetter, handler EventHandler, triggerer RunTriggerer, logger *slog.Logger) error {
 
 	if logger == nil {
 		logger = slog.Default()
@@ -92,7 +99,7 @@ func Subscribe(ctx context.Context, nc *nats.Conn, subject, durableName string,
 			return fmt.Errorf("nats subscribe: fetch: %w", err)
 		}
 		for _, m := range msgs {
-			if err := handleNATSMessage(ctx, m, secret, handler); err != nil {
+			if err := handleNATSMessage(ctx, m, secret, handler, triggerer); err != nil {
 				logger.Error("nats message handling failed, leaving unacked for redelivery",
 					slog.String("subject", m.Subject), slog.Any("error", err))
 				continue
@@ -102,7 +109,7 @@ func Subscribe(ctx context.Context, nc *nats.Conn, subject, durableName string,
 	}
 }
 
-func handleNATSMessage(ctx context.Context, m *nats.Msg, secret SecretGetter, handler EventHandler) error {
+func handleNATSMessage(ctx context.Context, m *nats.Msg, secret SecretGetter, handler EventHandler, triggerer RunTriggerer) error {
 	tenantID, err := uuid.Parse(m.Header.Get("Tenant-Id"))
 	if err != nil {
 		return fmt.Errorf("nats: invalid tenant header: %w", err)
@@ -115,21 +122,47 @@ func handleNATSMessage(ctx context.Context, m *nats.Msg, secret SecretGetter, ha
 		return fmt.Errorf("nats: invalid signature for tenant %s", tenantID)
 	}
 
-	// The correlation key rides in the payload ({"correlationKey": ...}) for the
-	// generic contract; the subject itself carries no per-tenant cardinality.
-	var envelope struct {
-		CorrelationKey string `json:"correlationKey"`
+	// Case A: check if payload is a workflow trigger request.
+	// triggerType is intentionally not read from the message — this ingress
+	// path is NATS, so the run's recorded trigger_type must always be
+	// "queue" regardless of what the publisher claims. Trusting a
+	// caller-supplied value would let a NATS publisher report
+	// triggerType:"webhook" and corrupt the audit trail trigger_type exists
+	// to provide.
+	var triggerReq struct {
+		WorkflowID     string          `json:"workflowId"`
+		InputContext   json.RawMessage `json:"inputContext"`
+		IdempotencyKey *string         `json:"idempotencyKey"`
+		CorrelationKey string          `json:"correlationKey"`
 	}
-	if err := json.Unmarshal(m.Data, &envelope); err != nil {
+	if err := json.Unmarshal(m.Data, &triggerReq); err != nil {
 		return fmt.Errorf("nats: malformed payload: %w", err)
 	}
 
-	resolved, err := handler.HandleEvent(ctx, tenantID, envelope.CorrelationKey, m.Data)
+	if triggerReq.WorkflowID != "" && triggerer != nil {
+		wfID, err := uuid.Parse(triggerReq.WorkflowID)
+		if err == nil {
+			_, err := triggerer.CreateRun(ctx, execution.CreateRunCommand{
+				TenantID:       tenantID,
+				WorkflowID:     wfID,
+				TriggerType:    "queue",
+				InputContext:   triggerReq.InputContext,
+				IdempotencyKey: triggerReq.IdempotencyKey,
+			})
+			return err
+		}
+	}
+
+	if handler == nil {
+		return fmt.Errorf("nats: event handler not configured")
+	}
+
+	resolved, err := handler.HandleEvent(ctx, tenantID, triggerReq.CorrelationKey, m.Data)
 	if err != nil {
 		return err
 	}
 	if !resolved {
-		_ = handler.RecordOrphanEvent(ctx, tenantID, envelope.CorrelationKey, m.Data, "no matching wait token")
+		_ = handler.RecordOrphanEvent(ctx, tenantID, triggerReq.CorrelationKey, m.Data, "no matching wait token")
 	}
 	return nil
 }

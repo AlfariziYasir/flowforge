@@ -2,17 +2,25 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
 	"flowforge/internal/auth"
+	authmocks "flowforge/internal/auth/mocks"
+	"flowforge/internal/domain"
 	"flowforge/internal/platform/config"
+	"flowforge/internal/platform/ratelimit"
 	"flowforge/internal/workflow"
 	workflowmocks "flowforge/internal/workflow/mocks"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -166,4 +174,137 @@ func TestNewRouter_PublishVsRollbackRouteDisambiguation(t *testing.T) {
 	router.ServeHTTP(recRoll, reqRoll)
 
 	assert.Equal(t, http.StatusOK, recRoll.Code)
+}
+
+type fakePinger struct {
+	err error
+}
+
+func (f *fakePinger) Ping(ctx context.Context) error {
+	return f.err
+}
+
+func TestHealthChecker(t *testing.T) {
+	tests := []struct {
+		name           string
+		db             Pinger
+		redis          Pinger
+		wantStatusCode int
+		wantSuccess    bool
+	}{
+		{
+			name:           "TestHealthChecker_AllUp",
+			db:             &fakePinger{err: nil},
+			redis:          &fakePinger{err: nil},
+			wantStatusCode: http.StatusOK,
+			wantSuccess:    true,
+		},
+		{
+			name:           "TestHealthChecker_DBDown",
+			db:             &fakePinger{err: errors.New("db connection timeout")},
+			redis:          &fakePinger{err: nil},
+			wantStatusCode: http.StatusServiceUnavailable,
+			wantSuccess:    false,
+		},
+		{
+			name:           "TestHealthChecker_RedisDown",
+			db:             &fakePinger{err: nil},
+			redis:          &fakePinger{err: errors.New("redis connection refused")},
+			wantStatusCode: http.StatusServiceUnavailable,
+			wantSuccess:    false,
+		},
+		{
+			name:           "TestHealthChecker_BothDown",
+			db:             &fakePinger{err: errors.New("db down")},
+			redis:          &fakePinger{err: errors.New("redis down")},
+			wantStatusCode: http.StatusServiceUnavailable,
+			wantSuccess:    false,
+		},
+		{
+			name:           "TestHealthChecker_NilPingers",
+			db:             nil,
+			redis:          nil,
+			wantStatusCode: http.StatusServiceUnavailable,
+			wantSuccess:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc := &HealthChecker{DB: tt.db, Redis: tt.redis}
+			req := httptest.NewRequest(http.MethodGet, "/health", nil)
+			rec := httptest.NewRecorder()
+
+			hc.ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.wantStatusCode, rec.Code)
+			var resp map[string]any
+			err := json.Unmarshal(rec.Body.Bytes(), &resp)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantSuccess, resp["success"])
+		})
+	}
+}
+
+type fakeRedisClient struct {
+	mu     sync.Mutex
+	counts map[string]int64
+}
+
+func newFakeRedisClient() *fakeRedisClient {
+	return &fakeRedisClient{counts: make(map[string]int64)}
+}
+
+func (f *fakeRedisClient) Incr(ctx context.Context, key string) *redis.IntCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.counts[key]++
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(f.counts[key])
+	return cmd
+}
+
+func (f *fakeRedisClient) Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd {
+	cmd := redis.NewBoolCmd(ctx)
+	cmd.SetVal(true)
+	return cmd
+}
+
+func TestNewRouterWithLimiter_RateLimitAppliesToAuthenticatedRoute(t *testing.T) {
+	jwtSvc := auth.NewJWTService("router-test-secret-key-32chars!!", 15*time.Minute, 7*24*time.Hour)
+	middleware := auth.NewAuthMiddleware(jwtSvc)
+
+	userID := uuid.New()
+	tenantID := uuid.New()
+
+	authUCMock := authmocks.NewMockAuthUseCase(t)
+	authUCMock.EXPECT().GetMe(mock.Anything, tenantID, userID).Return(&domain.User{
+		ID:       userID,
+		TenantID: tenantID,
+		Email:    "admin@flowforge.local",
+		Role:     "admin",
+	}, nil)
+
+	authHandler := auth.NewAuthHandler(authUCMock)
+	fakeRdb := newFakeRedisClient()
+	limiter := ratelimit.NewLimiter(fakeRdb, nil)
+
+	router := NewRouterWithLimiter(nil, authHandler, nil, nil, nil, middleware, nil, limiter, false)
+
+	pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, uuid.Nil, "admin@flowforge.local", "admin")
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/me", nil)
+	req.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	expectedKey := "ratelimit:tenant:" + tenantID.String() + ":general"
+	fakeRdb.mu.Lock()
+	incrCount := fakeRdb.counts[expectedKey]
+	fakeRdb.mu.Unlock()
+
+	assert.Equal(t, int64(1), incrCount, "Authenticated general route must invoke rate limiter with tenant key")
 }

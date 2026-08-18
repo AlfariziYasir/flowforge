@@ -24,6 +24,7 @@ import (
 	"flowforge/internal/domain"
 	"flowforge/internal/engine"
 	"flowforge/internal/execution/executor"
+	"flowforge/internal/platform/eventstream"
 	"flowforge/internal/platform/metrics"
 )
 
@@ -46,11 +47,14 @@ type CoordinatorConfig struct {
 	MaxBodyBytes  int64
 	WorkerID      string
 	Logger        *slog.Logger
-	// HTTPClient must be the SSRF-pinned client from internal/platform/safehttp;
+	// HTTPClient executes HTTP steps. The default is http.DefaultClient with
+	// an 8s timeout; a test can supply a mock transport or a nil client. A
 	// nil makes every HTTP step fail cleanly.
 	HTTPClient *http.Client
 	// Metrics may be nil; when set, the coordinator emits step and run telemetry.
 	Metrics *metrics.Metrics
+	// Events may be nil; when set, real-time monitoring events are published (D-3).
+	Events eventstream.Publisher
 	// Publisher may be nil; EVENT_PUBLISH steps fail cleanly without one.
 	Publisher executor.EventPublisher
 	// WaitTokens is the store EVENT_WAIT steps use to park runs; nil makes them
@@ -114,6 +118,14 @@ func (c *Coordinator) HandleRun(ctx context.Context, tenantID, runID uuid.UUID) 
 		c.cfg.Logger.Debug("duplicate run delivery, claim yielded no row", slog.String("runID", runID.String()))
 		return nil
 	}
+
+	c.publishEvent(ctx, domain.Event{
+		Type:      domain.EventRunStarted,
+		TenantID:  tenantID,
+		RunID:     &runID,
+		Status:    domain.RunStatusRunning,
+		Timestamp: time.Now().UTC(),
+	})
 
 	// One cancellable context shared by the tick loop and the heartbeat: when the
 	// heartbeat learns the lease was lost, it cancels workCtx and the loop stops.
@@ -286,6 +298,14 @@ func (c *Coordinator) executeWave(ctx context.Context, tenantID, runID uuid.UUID
 		g.SetLimit(c.cfg.Concurrency)
 		for _, step := range claimed {
 			step := step
+			c.publishEvent(ctx, domain.Event{
+				Type:      domain.EventStepStarted,
+				TenantID:  tenantID,
+				RunID:     &runID,
+				StepID:    &step.ID,
+				Status:    engine.StepStatusRunning,
+				Timestamp: time.Now().UTC(),
+			})
 			g.Go(func() error {
 				return c.runStepWithRetry(gctx, tenantID, runID, step, byKey, scope)
 			})
@@ -374,6 +394,22 @@ func (c *Coordinator) runStepWithRetry(ctx context.Context, tenantID, runID uuid
 				return fmt.Errorf("persist run waiting: %w", err)
 			}
 			c.cfg.Logger.Info("run parked on wait token", slog.String("nodeKey", step.NodeKey), slog.String("runID", runID.String()))
+			c.appendLog(ctx, tenantID, runID, &step.ID, domain.LogLevelInfo, "run parked on wait token", nil)
+			c.publishEvent(ctx, domain.Event{
+				Type:      domain.EventStepWaiting,
+				TenantID:  tenantID,
+				RunID:     &runID,
+				StepID:    &step.ID,
+				Status:    engine.StepStatusWaiting,
+				Timestamp: time.Now().UTC(),
+			})
+			c.publishEvent(ctx, domain.Event{
+				Type:      domain.EventRunWaiting,
+				TenantID:  tenantID,
+				RunID:     &runID,
+				Status:    domain.RunStatusWaiting,
+				Timestamp: time.Now().UTC(),
+			})
 			return nil
 		}
 
@@ -399,6 +435,15 @@ func (c *Coordinator) runStepWithRetry(ctx context.Context, tenantID, runID uuid
 				c.cfg.Metrics.StepDuration.WithLabelValues(node.NodeType, engine.StepStatusSucceeded).Observe(duration.Seconds())
 			}
 			c.cfg.Logger.Info("step succeeded", slog.String("nodeKey", step.NodeKey), slog.Int("attempt", attempt))
+			c.appendLog(ctx, tenantID, runID, &step.ID, domain.LogLevelInfo, "step succeeded", nil)
+			c.publishEvent(ctx, domain.Event{
+				Type:      domain.EventStepCompleted,
+				TenantID:  tenantID,
+				RunID:     &runID,
+				StepID:    &step.ID,
+				Status:    engine.StepStatusSucceeded,
+				Timestamp: time.Now().UTC(),
+			})
 			return nil
 		}
 
@@ -430,6 +475,15 @@ func (c *Coordinator) runStepWithRetry(ctx context.Context, tenantID, runID uuid
 				c.cfg.Metrics.StepDuration.WithLabelValues(node.NodeType, engine.StepStatusFailed).Observe(duration.Seconds())
 			}
 			c.cfg.Logger.Warn("step failed", slog.String("nodeKey", step.NodeKey), slog.Int("attempt", attempt), slog.Any("error", execErr))
+			c.appendLog(ctx, tenantID, runID, &step.ID, domain.LogLevelError, "step failed", errPayload)
+			c.publishEvent(ctx, domain.Event{
+				Type:      domain.EventStepFailed,
+				TenantID:  tenantID,
+				RunID:     &runID,
+				StepID:    &step.ID,
+				Status:    engine.StepStatusFailed,
+				Timestamp: time.Now().UTC(),
+			})
 			return nil
 		}
 
@@ -450,6 +504,18 @@ func (c *Coordinator) runStepWithRetry(ctx context.Context, tenantID, runID uuid
 		backoff := c.cfg.Retry.NextBackoff(attempt, c.rnd)
 		c.cfg.Logger.Warn("step scheduled for retry", slog.String("nodeKey", step.NodeKey),
 			slog.Int("attempt", attempt), slog.Duration("backoff", backoff))
+		c.appendLog(ctx, tenantID, runID, &step.ID, domain.LogLevelWarn, "step scheduled for retry", map[string]any{
+			"attempt": attempt,
+			"backoff": backoff.String(),
+		})
+		c.publishEvent(ctx, domain.Event{
+			Type:      domain.EventStepRetrying,
+			TenantID:  tenantID,
+			RunID:     &runID,
+			StepID:    &step.ID,
+			Status:    engine.StepStatusRetrying,
+			Timestamp: time.Now().UTC(),
+		})
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -501,6 +567,14 @@ func (c *Coordinator) finishRun(ctx context.Context, tenantID, runID uuid.UUID) 
 		}
 		c.cfg.Logger.Warn("run stuck: pending steps with no active path, marked failed",
 			slog.String("runID", runID.String()))
+		c.appendLog(ctx, tenantID, runID, nil, domain.LogLevelWarn, "run stuck: pending steps with no active path, marked failed", nil)
+		c.publishEvent(ctx, domain.Event{
+			Type:      domain.EventRunFailed,
+			TenantID:  tenantID,
+			RunID:     &runID,
+			Status:    domain.RunStatusFailed,
+			Timestamp: time.Now().UTC(),
+		})
 		return nil
 	}
 
@@ -517,7 +591,81 @@ func (c *Coordinator) finishRun(ctx context.Context, tenantID, runID uuid.UUID) 
 	if c.cfg.Metrics != nil {
 		c.cfg.Metrics.RunsFinished.WithLabelValues(tenantID.String(), status).Inc()
 	}
+	if status == domain.RunStatusSucceeded {
+		c.cfg.Logger.Info("run succeeded", slog.String("runID", runID.String()))
+		c.appendLog(ctx, tenantID, runID, nil, domain.LogLevelInfo, "run succeeded", nil)
+		c.publishEvent(ctx, domain.Event{
+			Type:      domain.EventRunCompleted,
+			TenantID:  tenantID,
+			RunID:     &runID,
+			Status:    domain.RunStatusSucceeded,
+			Timestamp: time.Now().UTC(),
+		})
+	} else {
+		c.cfg.Logger.Error("run failed", slog.String("runID", runID.String()))
+		c.appendLog(ctx, tenantID, runID, nil, domain.LogLevelError, "run failed", nil)
+		c.publishEvent(ctx, domain.Event{
+			Type:      domain.EventRunFailed,
+			TenantID:  tenantID,
+			RunID:     &runID,
+			Status:    domain.RunStatusFailed,
+			Timestamp: time.Now().UTC(),
+		})
+	}
 	return nil
+}
+
+// publishEvent publishes a real-time monitoring event best-effort (D-4) and records metrics (D-8).
+func (c *Coordinator) publishEvent(ctx context.Context, ev domain.Event) {
+	if c.cfg.Metrics != nil {
+		c.cfg.Metrics.EventsPublished.WithLabelValues(ev.TenantID.String(), ev.Type).Inc()
+	}
+	if c.cfg.Events == nil {
+		return
+	}
+	if err := c.cfg.Events.Publish(ctx, ev); err != nil {
+		c.cfg.Logger.Warn("eventstream: publish failed",
+			slog.String("type", ev.Type),
+			slog.String("tenantID", ev.TenantID.String()),
+			slog.Any("error", err))
+	}
+}
+
+// appendLog persists a durable log line best-effort — a failure here is logged
+// and swallowed, never propagated. Matches c.cfg.Metrics's existing discipline:
+// observability must never affect execution.
+func (c *Coordinator) appendLog(ctx context.Context, tenantID, runID uuid.UUID, stepRunID *uuid.UUID, level, message string, ctxData any) {
+	if c.logs == nil {
+		return
+	}
+	payload := json.RawMessage("{}")
+	if ctxData != nil {
+		switch v := ctxData.(type) {
+		case json.RawMessage:
+			if len(v) > 0 {
+				payload = v
+			}
+		case []byte:
+			if len(v) > 0 {
+				payload = json.RawMessage(v)
+			}
+		default:
+			if b, err := json.Marshal(v); err == nil && len(b) > 0 {
+				payload = b
+			}
+		}
+	}
+	entry := &domain.ExecutionLog{
+		TenantID:      tenantID,
+		WorkflowRunID: runID,
+		StepRunID:     stepRunID,
+		Level:         level,
+		Message:       message,
+		Context:       payload,
+	}
+	if err := c.logs.Append(ctx, entry); err != nil {
+		c.cfg.Logger.Warn("append execution log failed", slog.String("message", message), slog.Any("error", err))
+	}
 }
 
 func (c *Coordinator) loadGraph(ctx context.Context, tenantID, versionID uuid.UUID) (domain.Graph, error) {

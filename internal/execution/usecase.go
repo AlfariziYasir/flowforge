@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -190,6 +191,13 @@ func (uc *executionUseCase) CreateRun(ctx context.Context, cmd CreateRunCommand)
 	}
 
 	if created {
+		uc.publishEvent(ctx, domain.Event{
+			Type:      domain.EventRunCreated,
+			TenantID:  cmd.TenantID,
+			RunID:     &run.ID,
+			Status:    domain.RunStatusPending,
+			Timestamp: time.Now().UTC(),
+		})
 		if err := uc.queue.EnqueueRun(cmd.TenantID, run.ID); err != nil {
 			// Not fatal to the request: the run row exists and ReclaimStalePendingRuns
 			// will re-enqueue it — but an operator must be able to see the blip.
@@ -197,6 +205,13 @@ func (uc *executionUseCase) CreateRun(ctx context.Context, cmd CreateRunCommand)
 				slog.String("runID", run.ID.String()), slog.Any("error", err))
 			return run, nil
 		}
+		uc.publishEvent(ctx, domain.Event{
+			Type:      domain.EventRunQueued,
+			TenantID:  cmd.TenantID,
+			RunID:     &run.ID,
+			Status:    domain.RunStatusPending,
+			Timestamp: time.Now().UTC(),
+		})
 	}
 	return run, nil
 }
@@ -271,11 +286,25 @@ func (uc *executionUseCase) RetryRun(ctx context.Context, cmd RetryRunCommand) (
 	}
 
 	if created {
+		uc.publishEvent(ctx, domain.Event{
+			Type:      domain.EventRunRetryRequested,
+			TenantID:  cmd.TenantID,
+			RunID:     &newRun.ID,
+			Status:    domain.RunStatusPending,
+			Timestamp: time.Now().UTC(),
+		})
 		if err := uc.queue.EnqueueRun(cmd.TenantID, newRun.ID); err != nil {
 			uc.cfg.Logger.Warn("enqueue failed after retry, relying on stale-pending reclaim",
 				slog.String("runID", newRun.ID.String()), slog.Any("error", err))
 			return newRun, nil // recovered by ReclaimStalePendingRuns
 		}
+		uc.publishEvent(ctx, domain.Event{
+			Type:      domain.EventRunQueued,
+			TenantID:  cmd.TenantID,
+			RunID:     &newRun.ID,
+			Status:    domain.RunStatusPending,
+			Timestamp: time.Now().UTC(),
+		})
 	}
 	return newRun, nil
 }
@@ -294,9 +323,23 @@ func (uc *executionUseCase) CancelRun(ctx context.Context, tenantID, runID uuid.
 	if !canTransitionRun(domain.RunStatusRunning, domain.RunStatusCanceled) {
 		return ErrRunIllegalCancel
 	}
+	uc.publishEvent(ctx, domain.Event{
+		Type:      domain.EventRunCancelRequested,
+		TenantID:  tenantID,
+		RunID:     &runID,
+		Status:    domain.RunStatusRunning,
+		Timestamp: time.Now().UTC(),
+	})
 	if err := uc.runs.UpdateRunStatus(ctx, tenantID, runID, domain.RunStatusCanceled, true); err != nil {
 		return fmt.Errorf("cancel run: %w", err)
 	}
+	uc.publishEvent(ctx, domain.Event{
+		Type:      domain.EventRunCancelled,
+		TenantID:  tenantID,
+		RunID:     &runID,
+		Status:    domain.RunStatusCanceled,
+		Timestamp: time.Now().UTC(),
+	})
 	if uc.audit != nil {
 		if err := uc.audit.Record(ctx, domain.AuditEntry{
 			TenantID:   tenantID,
@@ -309,6 +352,21 @@ func (uc *executionUseCase) CancelRun(ctx context.Context, tenantID, runID uuid.
 		}
 	}
 	return nil
+}
+
+func (uc *executionUseCase) publishEvent(ctx context.Context, ev domain.Event) {
+	if uc.cfg.Metrics != nil {
+		uc.cfg.Metrics.EventsPublished.WithLabelValues(ev.TenantID.String(), ev.Type).Inc()
+	}
+	if uc.cfg.Events == nil {
+		return
+	}
+	if err := uc.cfg.Events.Publish(ctx, ev); err != nil {
+		uc.cfg.Logger.Warn("eventstream: publish failed",
+			slog.String("type", ev.Type),
+			slog.String("tenantID", ev.TenantID.String()),
+			slog.Any("error", err))
+	}
 }
 
 func (uc *executionUseCase) GetRun(ctx context.Context, tenantID, runID uuid.UUID) (*domain.WorkflowRun, error) {

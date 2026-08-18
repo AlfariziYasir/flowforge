@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,6 +33,10 @@ type Config struct {
 	GRPCPort   string
 	NATSURL    string
 	NATSStream string
+
+	CORSAllowedOrigins   []string
+	CORSAllowCredentials bool
+	MetricsPort          int
 }
 
 // Load populates configuration from environment variables with fallback defaults.
@@ -61,7 +66,25 @@ func Load() *Config {
 		GRPCPort:   getEnv("GRPC_PORT", "9090"),
 		NATSURL:    getEnv("NATS_URL", "nats://localhost:4222"),
 		NATSStream: getEnv("NATS_STREAM", "FLOWFORGE_EVENTS"),
+
+		CORSAllowedOrigins:   getEnvSlice("CORS_ALLOWED_ORIGINS", nil),
+		CORSAllowCredentials: getEnvBool("CORS_ALLOW_CREDENTIALS", false),
+		MetricsPort:          getEnvInt("METRICS_PORT", 9091),
 	}
+}
+
+func getEnvSlice(key string, fallback []string) []string {
+	if val := os.Getenv(key); val != "" {
+		parts := strings.Split(val, ",")
+		var res []string
+		for _, p := range parts {
+			if s := strings.TrimSpace(p); s != "" {
+				res = append(res, s)
+			}
+		}
+		return res
+	}
+	return fallback
 }
 
 func getEnvInt64(key string, fallback int64) int64 {

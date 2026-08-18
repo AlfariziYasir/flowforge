@@ -18,14 +18,14 @@ type DBTX interface {
 type txKey struct{}
 type dbtxKey struct{}
 
-// ContextWithTx injects an active pgx.Tx into the given context.
-func ContextWithTx(ctx context.Context, tx pgx.Tx) context.Context {
+// ContextWithTx injects an active DBTX transaction into the given context.
+func ContextWithTx(ctx context.Context, tx DBTX) context.Context {
 	return context.WithValue(ctx, txKey{}, tx)
 }
 
-// TxFromContext retrieves a pgx.Tx from context if present.
-func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
-	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
+// TxFromContext retrieves a DBTX transaction from context if present.
+func TxFromContext(ctx context.Context) (DBTX, bool) {
+	tx, ok := ctx.Value(txKey{}).(DBTX)
 	return tx, ok
 }
 

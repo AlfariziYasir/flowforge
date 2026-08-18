@@ -74,6 +74,12 @@ func (uc *executionUseCase) AnalyzeRun(ctx context.Context, cmd AnalyzeRunComman
 		res, err := parseAnalysisResponse(raw)
 		if err == nil {
 			uc.recordAnalysis(ctx, cmd.TenantID, cmd.RunID)
+			uc.publishEvent(ctx, domain.Event{
+				Type:      domain.EventAnalysisCompleted,
+				TenantID:  cmd.TenantID,
+				RunID:     &cmd.RunID,
+				Timestamp: time.Now().UTC(),
+			})
 			return &AnalysisResult{
 				RunID:         cmd.RunID,
 				Diagnosis:     res.Diagnosis,

@@ -8,6 +8,8 @@ import (
 	"github.com/google/uuid"
 
 	"flowforge/internal/domain"
+	"flowforge/internal/platform/eventstream"
+	"flowforge/internal/platform/metrics"
 )
 
 // Usecase-level commands, queries, and results. Repository-level filter types
@@ -89,10 +91,14 @@ type AnalysisResult struct {
 	Confidence    float64
 }
 
-// ExecutionConfig groups the AI knobs for the execution use case.
+// ExecutionConfig groups the AI and telemetry knobs for the execution use case.
 type ExecutionConfig struct {
 	AIMaxRetries     int
 	AIRequestTimeout time.Duration
+	// Events publishes real-time monitoring events; nil-safe (D-3).
+	Events eventstream.Publisher
+	// Metrics may be nil; when set, usecase-level events increment EventsPublished.
+	Metrics *metrics.Metrics
 	// Logger is used for non-fatal warnings (e.g. a swallowed enqueue error).
 	// Zero-value defaults to slog.Default() in the constructor.
 	Logger *slog.Logger

@@ -40,4 +40,6 @@ func TestMetrics_LabelDiscipline(t *testing.T) {
 	assert.Equal(t, []string{"status"}, labelNames(m.RunAge),
 		"run age histogram must NOT carry tenant_id (B-2)")
 	assert.Equal(t, []string{"queue"}, labelNames(m.QueueDepth))
+	assert.Equal(t, []string{"tenant_id"}, labelNames(m.SSEConnections), "SSE gauge must be per-tenant")
+	assert.Equal(t, []string{"tenant_id", "event_type"}, labelNames(m.EventsPublished), "events counter must be per-tenant and event_type")
 }

@@ -13,6 +13,9 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+
+	"flowforge/internal/domain"
+	"flowforge/internal/execution"
 )
 
 // EventHandler is the ingress adapters' port: the same HandleEvent every
@@ -20,6 +23,11 @@ import (
 type EventHandler interface {
 	HandleEvent(ctx context.Context, tenantID uuid.UUID, correlationKey string, payload []byte) (resolved bool, err error)
 	RecordOrphanEvent(ctx context.Context, tenantID uuid.UUID, correlationKey string, payload []byte, reason string) error
+}
+
+// RunTriggerer is the port for triggering workflow runs from queue/gRPC ingress (Case A).
+type RunTriggerer interface {
+	CreateRun(ctx context.Context, cmd execution.CreateRunCommand) (*domain.WorkflowRun, error)
 }
 
 // SecretGetter resolves a tenant's event-ingress signing secret. The concrete

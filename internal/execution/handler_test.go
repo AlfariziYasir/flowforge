@@ -10,8 +10,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -19,6 +22,7 @@ import (
 	"flowforge/internal/domain"
 	"flowforge/internal/engine"
 	"flowforge/internal/execution"
+	"flowforge/internal/platform/metrics"
 	"flowforge/internal/workflow"
 )
 
@@ -543,4 +547,113 @@ func TestHandler_RotateWebhookSecret(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "rotated-secret", decodedBody(t, rec)["data"].(map[string]any)["webhookSecret"])
+}
+
+type fakeClientManager struct {
+	eventsChan chan domain.Event
+	tenantID   uuid.UUID
+	unregCount int
+}
+
+func (f *fakeClientManager) Register(tenantID uuid.UUID) (string, <-chan domain.Event, func()) {
+	f.tenantID = tenantID
+	return "test-conn-123", f.eventsChan, func() {
+		f.unregCount++
+	}
+}
+
+func (f *fakeClientManager) Close() error {
+	return nil
+}
+
+// Phase 8: GET /api/v1/events streams SSE formatted events with tenant isolation.
+func TestHandler_StreamEvents(t *testing.T) {
+	tenantID := uuid.New()
+	stub := &stubUseCase{}
+	eventsCh := make(chan domain.Event, 10)
+	fakeMgr := &fakeClientManager{eventsChan: eventsCh}
+	h := execution.NewExecutionHandlerWithStream(stub, fakeMgr, nil)
+
+	t.Run("returns 401 Unauthorized when unauthenticated", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+		rec := httptest.NewRecorder()
+		h.StreamEvents(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("sets text/event-stream headers and streams events", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(authCtx(tenantID, uuid.New(), "viewer"))
+		defer cancel()
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+
+		runID := uuid.New()
+		eventsCh <- domain.Event{
+			Type:      domain.EventRunStarted,
+			ID:        "evt-12345",
+			TenantID:  tenantID,
+			RunID:     &runID,
+			Status:    "running",
+			Timestamp: time.Now().UTC(),
+		}
+
+		// Cancel context to complete handler execution
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+
+		h.StreamEvents(rec, req)
+
+		assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+		assert.Equal(t, "no-cache", rec.Header().Get("Cache-Control"))
+		assert.Equal(t, "keep-alive", rec.Header().Get("Connection"))
+		assert.Equal(t, "no", rec.Header().Get("X-Accel-Buffering"))
+
+		body := rec.Body.String()
+		assert.Contains(t, body, ": connected connId=test-conn-123\n\n")
+		assert.Contains(t, body, "event: workflow.run.started\n")
+		assert.Contains(t, body, "id: evt-12345\n")
+		assert.Contains(t, body, runID.String())
+		assert.Equal(t, 1, fakeMgr.unregCount, "Must unregister client upon disconnection")
+	})
+}
+
+// AD-1: Handler records SSEConnections gauge increments on connect and decrements on disconnect.
+func TestHandler_StreamEvents_RecordsSSEConnectionsMetric(t *testing.T) {
+	tenantID := uuid.New()
+	stub := &stubUseCase{}
+	eventsCh := make(chan domain.Event, 10)
+	fakeMgr := &fakeClientManager{eventsChan: eventsCh}
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	h := execution.NewExecutionHandlerWithStream(stub, fakeMgr, m)
+
+	ctx, cancel := context.WithCancel(authCtx(tenantID, uuid.New(), "viewer"))
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.StreamEvents(rec, req)
+	}()
+
+	// Assert gauge is 1 while connected
+	require.Eventually(t, func() bool {
+		val := testutil.ToFloat64(m.SSEConnections.WithLabelValues(tenantID.String()))
+		return val == 1.0
+	}, time.Second, 10*time.Millisecond, "SSEConnections gauge must equal 1 while active")
+
+	// Disconnect client
+	cancel()
+	<-done
+
+	// Assert gauge is 0 after disconnect
+	val := testutil.ToFloat64(m.SSEConnections.WithLabelValues(tenantID.String()))
+	assert.Equal(t, 0.0, val, "SSEConnections gauge must decrement back to 0 on disconnect")
 }

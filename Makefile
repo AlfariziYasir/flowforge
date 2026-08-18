@@ -33,7 +33,7 @@ ci: fmt-check vet build test
 
 # Nyalakan dependensi untuk integration test (tanpa api/worker)
 up:
-	docker compose up -d postgres redis migrate seed
+	docker compose up -d postgres redis nats migrate seed
 
 down:
 	docker compose down

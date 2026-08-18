@@ -3,6 +3,7 @@ package execution_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -275,11 +276,48 @@ func (f fakeGraph) LoadGraph(ctx context.Context, tenantID, versionID uuid.UUID)
 	return f.nodes, f.edges, nil
 }
 
-type fakeLogs struct{ calls int }
+type fakeLogs struct {
+	mu      sync.Mutex
+	calls   int
+	entries []*domain.ExecutionLog
+	err     error
+}
 
 func (f *fakeLogs) Append(ctx context.Context, entry *domain.ExecutionLog) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
-	return nil
+	f.entries = append(f.entries, entry)
+	return f.err
+}
+
+func (f *fakeLogs) getEntries() []*domain.ExecutionLog {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*domain.ExecutionLog, len(f.entries))
+	copy(out, f.entries)
+	return out
+}
+
+type fakeEvents struct {
+	mu     sync.Mutex
+	events []domain.Event
+	err    error
+}
+
+func (f *fakeEvents) Publish(ctx context.Context, ev domain.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, ev)
+	return f.err
+}
+
+func (f *fakeEvents) getEvents() []domain.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]domain.Event, len(f.events))
+	copy(out, f.events)
+	return out
 }
 
 // recordingTxRunner runs fn inline and records that it was invoked.
@@ -461,6 +499,82 @@ func coord(t *testing.T, graph fakeGraph, stepKeys []string, runCtx map[string]a
 			TickIdleDelay: time.Second,
 		})
 	}
+	return c, fr, fs
+}
+
+type fakeWaitTokenStore struct {
+	mu     sync.Mutex
+	tokens map[string]domain.StepWaitToken
+}
+
+func (f *fakeWaitTokenStore) CreateToken(ctx context.Context, token domain.StepWaitToken) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tokens == nil {
+		f.tokens = make(map[string]domain.StepWaitToken)
+	}
+	f.tokens[token.CorrelationKey] = token
+	return nil
+}
+
+func (f *fakeWaitTokenStore) CountActiveTokens(ctx context.Context, tenantID uuid.UUID) (int, error) {
+	return 0, nil
+}
+
+func coordWithLogs(t *testing.T, graph fakeGraph, stepKeys []string, runCtx map[string]any,
+	retry engine.RetryPolicy, logs *fakeLogs) (*execution.Coordinator, *fakeRunRepo, *fakeStepRepo) {
+	t.Helper()
+
+	fr := &fakeRunRepo{run: &domain.WorkflowRun{
+		ID:                uuid.New(),
+		TenantID:          uuid.New(),
+		WorkflowID:        uuid.New(),
+		WorkflowVersionID: uuid.New(),
+		Status:            domain.RunStatusRunning,
+	}}
+	if runCtx != nil {
+		fr.run.InputContext, _ = json.Marshal(runCtx)
+	}
+	fs := newFakeStepRepo(stepKeys)
+
+	c := execution.NewCoordinator(fr, fs, logs, graph, executor.NewRegistry(nil, 1<<20, nil), execution.CoordinatorConfig{
+		Concurrency: 4,
+		Lease:       60 * time.Second,
+		Retry:       retry,
+		Timeout:     engine.DefaultTimeoutPolicy(),
+		WorkerID:    "test",
+		Logger:      slog.New(slog.DiscardHandler),
+		WaitTokens:  &fakeWaitTokenStore{},
+	})
+	return c, fr, fs
+}
+
+func coordWithEvents(t *testing.T, graph fakeGraph, stepKeys []string, runCtx map[string]any,
+	retry engine.RetryPolicy, events *fakeEvents) (*execution.Coordinator, *fakeRunRepo, *fakeStepRepo) {
+	t.Helper()
+
+	fr := &fakeRunRepo{run: &domain.WorkflowRun{
+		ID:                uuid.New(),
+		TenantID:          uuid.New(),
+		WorkflowID:        uuid.New(),
+		WorkflowVersionID: uuid.New(),
+		Status:            domain.RunStatusRunning,
+	}}
+	if runCtx != nil {
+		fr.run.InputContext, _ = json.Marshal(runCtx)
+	}
+	fs := newFakeStepRepo(stepKeys)
+
+	c := execution.NewCoordinator(fr, fs, &fakeLogs{}, graph, executor.NewRegistry(nil, 1<<20, nil), execution.CoordinatorConfig{
+		Concurrency: 4,
+		Lease:       60 * time.Second,
+		Retry:       retry,
+		Timeout:     engine.DefaultTimeoutPolicy(),
+		WorkerID:    "test",
+		Logger:      slog.New(slog.DiscardHandler),
+		WaitTokens:  &fakeWaitTokenStore{},
+		Events:      events,
+	})
 	return c, fr, fs
 }
 
@@ -860,4 +974,249 @@ func TestRecordOrphanEvent_DeadLetters(t *testing.T) {
 	require.Len(t, tokens.orphans, 1)
 	assert.Equal(t, "K", tokens.orphans[0].CorrelationKey)
 	assert.Equal(t, "no matching token", tokens.orphans[0].Reason)
+}
+
+// Phase 8 / Log Writer: All 7 transitions produce durable execution logs with
+// accurate level, message, and step_run_id attribution.
+func TestCoordinator_ExecutionLogs_RecordedPerTransition(t *testing.T) {
+	t.Run("step_waiting_and_run_parked", func(t *testing.T) {
+		graph := buildGraph([]nodeDef{
+			{"waitNode", domain.NodeTypeEventWait, map[string]any{"correlationKey": "KEY-123", "timeout": "1h"}},
+		}, nil)
+		logs := &fakeLogs{}
+		c, fr, fs := coordWithLogs(t, graph, []string{"waitNode"}, nil, defaultRetry(), logs)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err)
+
+		entries := logs.getEntries()
+		require.NotEmpty(t, entries)
+
+		var waitLog *domain.ExecutionLog
+		for _, e := range entries {
+			if e.Message == "run parked on wait token" {
+				waitLog = e
+				break
+			}
+		}
+		require.NotNil(t, waitLog, "must record 'run parked on wait token'")
+		assert.Equal(t, domain.LogLevelInfo, waitLog.Level)
+		require.NotNil(t, waitLog.StepRunID)
+		assert.Equal(t, fs.steps["waitNode"].ID, *waitLog.StepRunID)
+		assert.Equal(t, fr.run.ID, waitLog.WorkflowRunID)
+		assert.Equal(t, fr.run.TenantID, waitLog.TenantID)
+	})
+
+	t.Run("step_succeeded_and_run_succeeded", func(t *testing.T) {
+		graph := buildGraph([]nodeDef{
+			{"a", domain.NodeTypeDelay, map[string]any{"seconds": 0}},
+		}, nil)
+		logs := &fakeLogs{}
+		c, fr, fs := coordWithLogs(t, graph, []string{"a"}, nil, defaultRetry(), logs)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err)
+
+		entries := logs.getEntries()
+		require.Len(t, entries, 2)
+
+		// 1. step succeeded
+		assert.Equal(t, domain.LogLevelInfo, entries[0].Level)
+		assert.Equal(t, "step succeeded", entries[0].Message)
+		require.NotNil(t, entries[0].StepRunID)
+		assert.Equal(t, fs.steps["a"].ID, *entries[0].StepRunID)
+
+		// 2. run succeeded
+		assert.Equal(t, domain.LogLevelInfo, entries[1].Level)
+		assert.Equal(t, "run succeeded", entries[1].Message)
+		assert.Nil(t, entries[1].StepRunID)
+		assert.Equal(t, fr.run.ID, entries[1].WorkflowRunID)
+	})
+
+	t.Run("step_retrying", func(t *testing.T) {
+		graph := buildGraph([]nodeDef{
+			{"retryNode", domain.NodeTypeDelay, map[string]any{"seconds": -1}},
+		}, nil)
+		logs := &fakeLogs{}
+		c, fr, fs := coordWithLogs(t, graph, []string{"retryNode"}, nil, engine.RetryPolicy{
+			MaxAttempts: 2,
+			BaseDelay:   time.Millisecond,
+			MaxDelay:    5 * time.Millisecond,
+		}, logs)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err)
+
+		entries := logs.getEntries()
+		var retryLog *domain.ExecutionLog
+		for _, e := range entries {
+			if e.Message == "step scheduled for retry" {
+				retryLog = e
+				break
+			}
+		}
+		require.NotNil(t, retryLog, "must record 'step scheduled for retry'")
+		assert.Equal(t, domain.LogLevelWarn, retryLog.Level)
+		require.NotNil(t, retryLog.StepRunID)
+		assert.Equal(t, fs.steps["retryNode"].ID, *retryLog.StepRunID)
+	})
+
+	t.Run("step_failed_and_run_failed", func(t *testing.T) {
+		graph := buildGraph([]nodeDef{
+			{"failNode", domain.NodeTypeDelay, map[string]any{"seconds": -1}},
+		}, nil)
+		logs := &fakeLogs{}
+		c, fr, fs := coordWithLogs(t, graph, []string{"failNode"}, nil, engine.RetryPolicy{
+			MaxAttempts: 1,
+			BaseDelay:   time.Millisecond,
+			MaxDelay:    time.Millisecond,
+		}, logs)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err)
+
+		entries := logs.getEntries()
+		require.Len(t, entries, 2)
+
+		// 1. step failed
+		assert.Equal(t, domain.LogLevelError, entries[0].Level)
+		assert.Equal(t, "step failed", entries[0].Message)
+		require.NotNil(t, entries[0].StepRunID)
+		assert.Equal(t, fs.steps["failNode"].ID, *entries[0].StepRunID)
+		assert.Contains(t, string(entries[0].Context), "message")
+
+		// 2. run failed
+		assert.Equal(t, domain.LogLevelError, entries[1].Level)
+		assert.Equal(t, "run failed", entries[1].Message)
+		assert.Nil(t, entries[1].StepRunID)
+	})
+
+	t.Run("run_stuck_liveness_check", func(t *testing.T) {
+		// Graph only defines node 'a', but step repo has 'a' and 'b'.
+		// 'a' succeeds, 'b' remains pending and unreachable, causing run stuck.
+		graph := buildGraph([]nodeDef{
+			{"a", domain.NodeTypeDelay, map[string]any{"seconds": 0}},
+		}, nil)
+		logs := &fakeLogs{}
+		c, fr, _ := coordWithLogs(t, graph, []string{"a", "b"}, nil, defaultRetry(), logs)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err)
+
+		entries := logs.getEntries()
+		var stuckLog *domain.ExecutionLog
+		for _, e := range entries {
+			if e.Message == "run stuck: pending steps with no active path, marked failed" {
+				stuckLog = e
+				break
+			}
+		}
+		require.NotNil(t, stuckLog, "must record stuck run liveness failure")
+		assert.Equal(t, domain.LogLevelWarn, stuckLog.Level)
+		assert.Nil(t, stuckLog.StepRunID)
+		assert.Equal(t, fr.run.ID, stuckLog.WorkflowRunID)
+	})
+}
+
+// Phase 8 / Log Writer: Append error is swallowed and never fails execution.
+func TestCoordinator_ExecutionLogs_AppendErrorDoesNotFailExecution(t *testing.T) {
+	graph := buildGraph([]nodeDef{
+		{"a", domain.NodeTypeDelay, map[string]any{"seconds": 0}},
+	}, nil)
+	logs := &fakeLogs{err: errors.New("database connection refused")}
+	c, fr, fs := coordWithLogs(t, graph, []string{"a"}, nil, defaultRetry(), logs)
+
+	err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+	require.NoError(t, err, "Append error must not propagate or fail HandleRun")
+
+	assert.Equal(t, []string{domain.RunStatusSucceeded}, fr.statuses)
+	assert.Equal(t, engine.StepStatusSucceeded, fs.steps["a"].Status)
+	assert.GreaterOrEqual(t, logs.calls, 2, "Append must have been called despite errors")
+}
+
+// Phase 8: Real-Time Monitoring Events are emitted for coordinator transitions.
+func TestCoordinator_RealTimeEvents_PublishedPerTransition(t *testing.T) {
+	t.Run("step_started_completed_and_run_completed", func(t *testing.T) {
+		graph := buildGraph([]nodeDef{
+			{"node1", domain.NodeTypeDelay, map[string]any{"seconds": 0}},
+		}, nil)
+		events := &fakeEvents{}
+		c, fr, fs := coordWithEvents(t, graph, []string{"node1"}, nil, defaultRetry(), events)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{domain.RunStatusSucceeded}, fr.statuses)
+		assert.Equal(t, engine.StepStatusSucceeded, fs.steps["node1"].Status)
+
+		evList := events.getEvents()
+		// Expected sequence:
+		// 1. workflow.run.started
+		// 2. step.started
+		// 3. step.completed
+		// 4. workflow.run.completed
+		require.Len(t, evList, 4)
+
+		assert.Equal(t, domain.EventRunStarted, evList[0].Type)
+		assert.Equal(t, fr.run.ID, *evList[0].RunID)
+		assert.Nil(t, evList[0].StepID)
+
+		assert.Equal(t, domain.EventStepStarted, evList[1].Type)
+		assert.Equal(t, fr.run.ID, *evList[1].RunID)
+		assert.Equal(t, fs.steps["node1"].ID, *evList[1].StepID)
+
+		assert.Equal(t, domain.EventStepCompleted, evList[2].Type)
+		assert.Equal(t, fr.run.ID, *evList[2].RunID)
+		assert.Equal(t, fs.steps["node1"].ID, *evList[2].StepID)
+
+		assert.Equal(t, domain.EventRunCompleted, evList[3].Type)
+		assert.Equal(t, fr.run.ID, *evList[3].RunID)
+		assert.Nil(t, evList[3].StepID)
+	})
+
+	t.Run("step_retrying_failed_and_run_failed", func(t *testing.T) {
+		graph := buildGraph([]nodeDef{
+			{"failNode", domain.NodeTypeTransform, map[string]any{"expression": "bad-syntax"}},
+		}, nil)
+		events := &fakeEvents{}
+		// Retry with maxAttempts: 2
+		c, fr, fs := coordWithEvents(t, graph, []string{"failNode"}, nil, engine.RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}, events)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err)
+
+		evList := events.getEvents()
+		// Sequence:
+		// 1. workflow.run.started
+		// 2. step.started
+		// 3. step.retrying
+		// 4. step.failed
+		// 5. workflow.run.failed
+		require.Len(t, evList, 5)
+
+		assert.Equal(t, domain.EventRunStarted, evList[0].Type)
+		assert.Equal(t, domain.EventStepStarted, evList[1].Type)
+		assert.Equal(t, domain.EventStepRetrying, evList[2].Type)
+		assert.Equal(t, fs.steps["failNode"].ID, *evList[2].StepID)
+
+		assert.Equal(t, domain.EventStepFailed, evList[3].Type)
+		assert.Equal(t, fs.steps["failNode"].ID, *evList[3].StepID)
+
+		assert.Equal(t, domain.EventRunFailed, evList[4].Type)
+		assert.Nil(t, evList[4].StepID)
+	})
+
+	t.Run("publish_error_does_not_fail_execution", func(t *testing.T) {
+		graph := buildGraph([]nodeDef{
+			{"node1", domain.NodeTypeDelay, map[string]any{"seconds": 0}},
+		}, nil)
+		events := &fakeEvents{err: errors.New("redis pubsub connection error")}
+		c, fr, fs := coordWithEvents(t, graph, []string{"node1"}, nil, defaultRetry(), events)
+
+		err := c.HandleRun(context.Background(), fr.run.TenantID, fr.run.ID)
+		require.NoError(t, err, "Event publishing error must be swallowed and never fail execution (D-4)")
+
+		assert.Equal(t, []string{domain.RunStatusSucceeded}, fr.statuses)
+		assert.Equal(t, engine.StepStatusSucceeded, fs.steps["node1"].Status)
+	})
 }

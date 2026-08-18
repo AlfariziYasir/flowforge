@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,13 +16,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	redisclient "github.com/redis/go-redis/v9"
 
 	"flowforge/internal/engine"
 	"flowforge/internal/execution"
 	"flowforge/internal/execution/executor"
+	"flowforge/internal/platform/ai"
+	"flowforge/internal/platform/audit"
 	"flowforge/internal/platform/config"
 	"flowforge/internal/platform/eventbus"
+	"flowforge/internal/platform/eventstream"
 	"flowforge/internal/platform/logger"
 	"flowforge/internal/platform/metrics"
 	"flowforge/internal/platform/postgres"
@@ -65,6 +71,8 @@ func main() {
 
 	// Wiring: repositories, SSRF boundary, executors, coordinator, queue.
 	verRepo := workflow.NewVersionRepository(dbPool)
+	wfRepo := workflow.NewWorkflowRepository(dbPool)
+	auditRepo := audit.NewAuditRepository(dbPool)
 	execRepo := execution.NewExecutionRepository(dbPool)
 	uow := postgres.NewUnitOfWork(dbPool)
 
@@ -84,8 +92,43 @@ func main() {
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
 
+	// Phase 12 Step 6: Start HTTP metrics server on cfg.MetricsPort
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	metricsSrv := &http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.MetricsPort),
+		Handler:      metricsMux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Info("Starting FlowForge Worker metrics endpoint", slog.Int("port", cfg.MetricsPort))
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("worker metrics server failed", slog.Any("error", err))
+		}
+	}()
+
 	queueClient := queue.NewClient(rClient)
 	defer queueClient.Close()
+
+	// Execution usecase for Case A run triggering
+	wfUC := workflow.NewWorkflowUseCase(wfRepo, verRepo, auditRepo, uow)
+	aiProvider := ai.NewDeepSeekProvider(ai.Config{
+		APIKey:         cfg.AIProviderAPIKey,
+		Model:          cfg.AIModel,
+		BaseURL:        cfg.AIBaseURL,
+		RequestTimeout: cfg.AIRequestTimeout,
+	})
+	execUC := execution.NewExecutionUseCase(
+		wfUC, execRepo, execRepo, execRepo, verRepo, queueClient, auditRepo, uow, aiProvider, execRepo,
+		execution.ExecutionConfig{
+			AIMaxRetries:     cfg.AIMaxRetries,
+			AIRequestTimeout: cfg.AIRequestTimeout,
+			Events:           eventstream.NewRedisPublisher(rClient),
+			Metrics:          m,
+			Logger:           log,
+		},
+	)
 
 	// Phase 7 event-ingress port: the worker handles inbound events directly via
 	// an EventService (no run-lifecycle or AI deps needed here).
@@ -130,7 +173,7 @@ func main() {
 		natsWG.Add(1)
 		go func() {
 			defer natsWG.Done()
-			if err := eventbus.Subscribe(natsCtx, nc, "flowforge.events.>", "flowforge-worker", secretGetter, eventService, log); err != nil {
+			if err := eventbus.SubscribeWithTriggerer(natsCtx, nc, "flowforge.events.>", "flowforge-worker", secretGetter, eventService, execUC, log); err != nil {
 				log.Error("nats subscriber exited", slog.Any("error", err))
 			}
 		}()
@@ -150,6 +193,7 @@ func main() {
 			Logger:       log,
 			HTTPClient:   httpClient,
 			Metrics:      m,
+			Events:       eventstream.NewRedisPublisher(rClient),
 			Publisher:    queueClient,
 		},
 	)
@@ -184,6 +228,11 @@ func main() {
 	}
 	natsWG.Wait()
 	server.Shutdown()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	_ = metricsSrv.Shutdown(shutdownCtx)
+
 	log.Info("Worker service stopped cleanly")
 }
 

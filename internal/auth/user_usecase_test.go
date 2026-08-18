@@ -14,6 +14,7 @@ import (
 	"flowforge/internal/auth"
 	authmocks "flowforge/internal/auth/mocks"
 	"flowforge/internal/domain"
+	domainmocks "flowforge/internal/domain/mocks"
 )
 
 type recordingTxRunner struct {
@@ -56,6 +57,70 @@ func TestUserUseCase_CreateUser(t *testing.T) {
 		is.Equal("newuser@flowforge.local", user.Email)
 		is.Equal("editor", user.Role)
 		is.True(user.IsActive)
+	})
+
+	t.Run("successfully audits user creation inside transaction", func(t *testing.T) {
+		req := require.New(t)
+		is := assert.New(t)
+
+		userRepo := authmocks.NewMockUserRepository(t)
+		userRepo.EXPECT().CreateUser(mock.Anything, mock.Anything).Return(nil)
+
+		auditRepo := domainmocks.NewMockAuditRepository(t)
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
+			return e.TenantID == tenantID && e.Action == auth.ActionUserCreated && e.EntityType == "user" && e.EntityID != nil
+		})).Return(nil).Once()
+
+		txRunner := &recordingTxRunner{}
+		uc := auth.NewUserUseCaseWithTxAndAudit(userRepo, passSvc, nil, 7*24*time.Hour, txRunner, auditRepo)
+
+		cmd := auth.CreateUserCommand{
+			TenantID: tenantID,
+			Email:    "auditeduser@flowforge.local",
+			Password: "ValidPassword123",
+			Role:     "editor",
+		}
+
+		user, err := uc.CreateUser(ctx, cmd)
+		req.NoError(err)
+		is.NotNil(user)
+		is.True(txRunner.entered, "CreateUser must execute inside a transaction")
+	})
+
+	t.Run("successfully audits user creation with actual actor attribution", func(t *testing.T) {
+		req := require.New(t)
+		is := assert.New(t)
+
+		actorID := uuid.New()
+		userRepo := authmocks.NewMockUserRepository(t)
+		userRepo.EXPECT().CreateUser(mock.Anything, mock.Anything).Return(nil)
+
+		auditRepo := domainmocks.NewMockAuditRepository(t)
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
+			return e.TenantID == tenantID &&
+				e.Action == auth.ActionUserCreated &&
+				e.EntityType == "user" &&
+				e.EntityID != nil &&
+				e.ActorUserID != nil &&
+				*e.ActorUserID == actorID
+		})).Return(nil).Once()
+
+		txRunner := &recordingTxRunner{}
+		uc := auth.NewUserUseCaseWithTxAndAudit(userRepo, passSvc, nil, 7*24*time.Hour, txRunner, auditRepo)
+
+		cmd := auth.CreateUserCommand{
+			ActorID:  actorID,
+			TenantID: tenantID,
+			Email:    "auditedactor@flowforge.local",
+			Password: "ValidPassword123",
+			Role:     "editor",
+		}
+
+		user, err := uc.CreateUser(ctx, cmd)
+		req.NoError(err)
+		is.NotNil(user)
+		is.NotEqual(actorID, user.ID)
+		is.True(txRunner.entered, "CreateUser must execute inside a transaction")
 	})
 
 	t.Run("returns error when password is too short", func(t *testing.T) {
@@ -174,6 +239,45 @@ func TestUserUseCase_SelfDeactivationGuardAndRevocation(t *testing.T) {
 		updated, err := uc.UpdateUser(ctx, cmd)
 		req.NoError(err)
 		is.False(updated.IsActive)
+	})
+
+	t.Run("successfully audits user update inside transaction", func(t *testing.T) {
+		req := require.New(t)
+		is := assert.New(t)
+
+		targetUser := &domain.User{
+			ID:           uuid.New(),
+			TenantID:     tenantID,
+			Email:        "target@flowforge.local",
+			PasswordHash: hashedPass,
+			Role:         "viewer",
+			IsActive:     true,
+		}
+
+		userRepo := authmocks.NewMockUserRepository(t)
+		userRepo.EXPECT().FindByID(mock.Anything, tenantID, targetUser.ID).Return(targetUser, nil)
+		userRepo.EXPECT().UpdateUser(mock.Anything, mock.Anything).Return(nil)
+
+		auditRepo := domainmocks.NewMockAuditRepository(t)
+		auditRepo.EXPECT().Record(mock.Anything, mock.MatchedBy(func(e domain.AuditEntry) bool {
+			return e.TenantID == tenantID && e.ActorUserID != nil && *e.ActorUserID == user.ID && e.Action == auth.ActionUserUpdated && e.EntityType == "user" && *e.EntityID == targetUser.ID
+		})).Return(nil).Once()
+
+		txRunner := &recordingTxRunner{}
+		uc := auth.NewUserUseCaseWithTxAndAudit(userRepo, passSvc, nil, 7*24*time.Hour, txRunner, auditRepo)
+
+		newRole := "admin"
+		cmd := auth.UpdateUserCommand{
+			ActorID:  user.ID,
+			TenantID: tenantID,
+			UserID:   targetUser.ID,
+			Role:     &newRole,
+		}
+
+		updated, err := uc.UpdateUser(ctx, cmd)
+		req.NoError(err)
+		is.NotNil(updated)
+		is.True(txRunner.entered, "UpdateUser must execute inside a transaction")
 	})
 
 	t.Run("triggers revocation timestamp and session deletion when user is deleted", func(t *testing.T) {

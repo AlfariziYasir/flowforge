@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -57,6 +58,7 @@ type authUseCase struct {
 	blacklist     TokenBlacklist
 	sessionStore  SessionStore
 	refreshExpiry time.Duration
+	audit         domain.AuditRepository
 	logger        *slog.Logger
 	dummyHash     string
 }
@@ -70,7 +72,7 @@ func NewAuthUseCase(
 	sessionStore SessionStore,
 	refreshExpiry time.Duration,
 ) AuthUseCase {
-	return NewAuthUseCaseWithLogger(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, refreshExpiry, nil)
+	return NewAuthUseCaseWithAudit(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, refreshExpiry, nil, nil)
 }
 
 func NewAuthUseCaseWithLogger(
@@ -81,6 +83,20 @@ func NewAuthUseCaseWithLogger(
 	blacklist TokenBlacklist,
 	sessionStore SessionStore,
 	refreshExpiry time.Duration,
+	logger *slog.Logger,
+) AuthUseCase {
+	return NewAuthUseCaseWithAudit(tenantUC, userRepo, jwtSvc, passSvc, blacklist, sessionStore, refreshExpiry, nil, logger)
+}
+
+func NewAuthUseCaseWithAudit(
+	tenantUC tenant.TenantUseCase,
+	userRepo UserRepository,
+	jwtSvc JWTService,
+	passSvc PasswordService,
+	blacklist TokenBlacklist,
+	sessionStore SessionStore,
+	refreshExpiry time.Duration,
+	audit domain.AuditRepository,
 	logger *slog.Logger,
 ) AuthUseCase {
 	if refreshExpiry <= 0 {
@@ -116,6 +132,7 @@ func NewAuthUseCaseWithLogger(
 		blacklist:     blacklist,
 		sessionStore:  sessionStore,
 		refreshExpiry: refreshExpiry,
+		audit:         audit,
 		logger:        logger,
 		dummyHash:     dummyHash,
 	}
@@ -190,6 +207,21 @@ func (u *authUseCase) Login(ctx context.Context, tenantSlug, email, password str
 	pair, err := u.jwtSvc.GenerateTokenPair(usr.ID, usr.TenantID, sessionID, usr.Email, usr.Role)
 	if err != nil {
 		return nil, fmt.Errorf("generate auth tokens: %w", err)
+	}
+
+	if u.audit != nil {
+		meta, _ := json.Marshal(map[string]string{
+			"ipAddress": ipAddress,
+			"userAgent": userAgent,
+		})
+		_ = u.audit.Record(ctx, domain.AuditEntry{
+			TenantID:    usr.TenantID,
+			ActorUserID: &usr.ID,
+			Action:      ActionUserLoggedIn,
+			EntityType:  "user",
+			EntityID:    &usr.ID,
+			Metadata:    meta,
+		})
 	}
 
 	return &AuthResult{

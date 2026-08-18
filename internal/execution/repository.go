@@ -765,10 +765,14 @@ func (r *executionRepository) ListLogs(ctx context.Context, f ListLogsFilter) ([
 }
 
 func (r *executionRepository) Append(ctx context.Context, entry *domain.ExecutionLog) error {
+	ctxPayload := entry.Context
+	if len(ctxPayload) == 0 {
+		ctxPayload = json.RawMessage("{}")
+	}
 	query, args, err := psql.Insert("execution_logs").
 		Columns("id", "tenant_id", "workflow_run_id", "step_run_id", "level", "message", "context", "created_at").
 		Values(uuid.New(), entry.TenantID, entry.WorkflowRunID, entry.StepRunID, entry.Level,
-			entry.Message, entry.Context, time.Now()).
+			entry.Message, ctxPayload, time.Now()).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("build insert log: %w", err)

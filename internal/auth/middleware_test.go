@@ -265,3 +265,111 @@ func TestRequireRole(t *testing.T) {
 		is.Equal(http.StatusUnauthorized, rec.Code)
 	})
 }
+
+func TestAuthenticateWithTokenSource(t *testing.T) {
+	secret := "middleware-test-secret"
+	jwtSvc := auth.NewJWTService(secret, 15*time.Minute, 7*24*time.Hour)
+	middleware := auth.NewAuthMiddleware(jwtSvc)
+
+	dummyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, ok := auth.AuthUserFromContext(r.Context())
+		if !ok {
+			http.Error(w, "missing auth user", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(user.Email))
+	})
+
+	t.Run("allows token from query param when enabled", func(t *testing.T) {
+		is := assert.New(t)
+
+		userID := uuid.New()
+		tenantID := uuid.New()
+		email := "query@flowforge.local"
+		role := "operator"
+
+		pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, uuid.Nil, email, role)
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/events?token="+pair.AccessToken, nil)
+		rec := httptest.NewRecorder()
+
+		middleware.AuthenticateWithTokenSource(true)(dummyHandler).ServeHTTP(rec, req)
+
+		is.Equal(http.StatusOK, rec.Code)
+		is.Equal(email, rec.Body.String())
+	})
+
+	t.Run("rejects query param token when allowQueryParam is false", func(t *testing.T) {
+		is := assert.New(t)
+
+		userID := uuid.New()
+		tenantID := uuid.New()
+		email := "query@flowforge.local"
+		role := "operator"
+
+		pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, uuid.Nil, email, role)
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/events?token="+pair.AccessToken, nil)
+		rec := httptest.NewRecorder()
+
+		middleware.AuthenticateWithTokenSource(false)(dummyHandler).ServeHTTP(rec, req)
+
+		is.Equal(http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("prefers Authorization header over query param", func(t *testing.T) {
+		is := assert.New(t)
+
+		headerUserID := uuid.New()
+		headerTenantID := uuid.New()
+		headerEmail := "header@flowforge.local"
+		headerRole := "operator"
+
+		queryUserID := uuid.New()
+		queryTenantID := uuid.New()
+		queryEmail := "query@flowforge.local"
+		queryRole := "operator"
+
+		headerPair, err := jwtSvc.GenerateTokenPair(headerUserID, headerTenantID, uuid.Nil, headerEmail, headerRole)
+		require.NoError(t, err)
+		queryPair, err := jwtSvc.GenerateTokenPair(queryUserID, queryTenantID, uuid.Nil, queryEmail, queryRole)
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/events?token="+queryPair.AccessToken, nil)
+		req.Header.Set("Authorization", "Bearer "+headerPair.AccessToken)
+		rec := httptest.NewRecorder()
+
+		middleware.AuthenticateWithTokenSource(true)(dummyHandler).ServeHTTP(rec, req)
+
+		is.Equal(http.StatusOK, rec.Code)
+		is.Equal(headerEmail, rec.Body.String())
+	})
+
+	t.Run("rejects revoked token via query param", func(t *testing.T) {
+		is := assert.New(t)
+
+		mockBlacklist := new(authmocks.MockTokenBlacklist)
+		mwWithBlacklist := auth.NewAuthMiddlewareWithBlacklist(jwtSvc, mockBlacklist)
+
+		userID := uuid.New()
+		tenantID := uuid.New()
+		email := "revoked@flowforge.local"
+		role := "viewer"
+
+		pair, err := jwtSvc.GenerateTokenPair(userID, tenantID, uuid.Nil, email, role)
+		require.NoError(t, err)
+
+		mockBlacklist.On("IsRevoked", mock.Anything, mock.AnythingOfType("string")).Return(true, nil).Once()
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/events?token="+pair.AccessToken, nil)
+		rec := httptest.NewRecorder()
+
+		mwWithBlacklist.AuthenticateWithTokenSource(true)(dummyHandler).ServeHTTP(rec, req)
+
+		is.Equal(http.StatusUnauthorized, rec.Code)
+		mockBlacklist.AssertExpectations(t)
+	})
+}

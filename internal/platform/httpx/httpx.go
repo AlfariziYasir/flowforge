@@ -34,6 +34,7 @@ const (
 	CodeStepNotFound        = "STEP_NOT_FOUND"
 	CodeAIInvalidResponse   = "AI_INVALID_RESPONSE"
 	CodeAIGenerationFailed  = "AI_GENERATION_FAILED"
+	CodeRateLimitExceeded   = "RATE_LIMIT_EXCEEDED"
 )
 
 type Envelope struct {

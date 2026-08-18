@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
 
+	"flowforge/internal/domain"
+	"flowforge/internal/execution"
 	"flowforge/internal/execution/executor"
 	"flowforge/internal/platform/eventbus/eventspb"
 )
@@ -73,6 +76,7 @@ func TestRouter_Publish(t *testing.T) {
 }
 
 type fakeHandler struct {
+	mu       sync.Mutex
 	resolved bool
 	received string
 	lastKey  string
@@ -80,14 +84,24 @@ type fakeHandler struct {
 }
 
 func (f *fakeHandler) HandleEvent(ctx context.Context, tenantID uuid.UUID, correlationKey string, payload []byte) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastKey = correlationKey
 	f.received = string(payload)
 	return f.resolved, nil
 }
 
 func (f *fakeHandler) RecordOrphanEvent(ctx context.Context, tenantID uuid.UUID, correlationKey string, payload []byte, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.orphans++
 	return nil
+}
+
+func (f *fakeHandler) LastKey() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastKey
 }
 
 const testSecret = "eventbus-test-secret"
@@ -212,8 +226,8 @@ func TestSubscribe_OneBadMessageDoesNotStopSubsequentProcessing(t *testing.T) {
 	// Poll handler to confirm GOOD-1 was processed
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if handler.lastKey == "GOOD-1" {
-			assert.Equal(t, "GOOD-1", handler.lastKey)
+		if handler.LastKey() == "GOOD-1" {
+			assert.Equal(t, "GOOD-1", handler.LastKey())
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -221,3 +235,204 @@ func TestSubscribe_OneBadMessageDoesNotStopSubsequentProcessing(t *testing.T) {
 	t.Fatal("subscriber stopped processing after bad message; GOOD-1 was never received")
 }
 
+type fakeTriggerer struct {
+	mu      sync.Mutex
+	lastCmd execution.CreateRunCommand
+}
+
+func (f *fakeTriggerer) CreateRun(ctx context.Context, cmd execution.CreateRunCommand) (*domain.WorkflowRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastCmd = cmd
+	return &domain.WorkflowRun{
+		ID:          uuid.New(),
+		TenantID:    cmd.TenantID,
+		WorkflowID:  cmd.WorkflowID,
+		TriggerType: cmd.TriggerType,
+	}, nil
+}
+
+func TestGRPC_TriggerRun(t *testing.T) {
+	lis := bufconn.Listen(1024 * 1024)
+	triggerer := &fakeTriggerer{}
+	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(AuthInterceptor(fixedSecret)))
+	eventspb.RegisterEventListenerServer(grpcSrv, NewEventListenerServerWithTriggerer(nil, triggerer))
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+	defer grpcSrv.Stop()
+
+	pub := NewGRPCPublisher(fixedSecret)
+	pub.dial = func(ctx context.Context, target string) (*grpc.ClientConn, error) {
+		return grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}), grpc.WithInsecure())
+	}
+
+	wfID := uuid.New()
+	tenantID := uuid.New()
+	err := pub.Publish(context.Background(), executor.PublishInput{
+		EventType: "trigger.run",
+		TenantID:  tenantID,
+		Payload:   []byte(`{"workflowId":"` + wfID.String() + `","triggerType":"grpc","inputContext":{"orderId":"123"}}`),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, wfID, triggerer.lastCmd.WorkflowID)
+	assert.Equal(t, "grpc", triggerer.lastCmd.TriggerType)
+	assert.Equal(t, tenantID, triggerer.lastCmd.TenantID)
+}
+
+// TestGRPC_TriggerRun_ClampsCallerReportedTriggerType proves the server never
+// trusts a caller-supplied triggerType — it must always record "grpc" for
+// this ingress path, regardless of what the request claims. Without the
+// clamp, a gRPC caller could report triggerType:"manual" and have it
+// recorded as if a human had triggered the run through the UI, corrupting
+// the audit trail trigger_type is meant to be.
+func TestGRPC_TriggerRun_ClampsCallerReportedTriggerType(t *testing.T) {
+	lis := bufconn.Listen(1024 * 1024)
+	triggerer := &fakeTriggerer{}
+	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(AuthInterceptor(fixedSecret)))
+	eventspb.RegisterEventListenerServer(grpcSrv, NewEventListenerServerWithTriggerer(nil, triggerer))
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+	defer grpcSrv.Stop()
+
+	pub := NewGRPCPublisher(fixedSecret)
+	pub.dial = func(ctx context.Context, target string) (*grpc.ClientConn, error) {
+		return grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}), grpc.WithInsecure())
+	}
+
+	wfID := uuid.New()
+	tenantID := uuid.New()
+	err := pub.Publish(context.Background(), executor.PublishInput{
+		EventType: "trigger.run",
+		TenantID:  tenantID,
+		// The caller lies and claims "manual" — the server must ignore it.
+		Payload: []byte(`{"workflowId":"` + wfID.String() + `","triggerType":"manual"}`),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, wfID, triggerer.lastCmd.WorkflowID)
+	assert.Equal(t, "grpc", triggerer.lastCmd.TriggerType, "the gRPC ingress path must force triggerType=grpc, never trust the caller's claim")
+}
+
+func TestNATS_TriggerRun(t *testing.T) {
+	natsURL := "nats://localhost:4222"
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Skipf("nats not reachable: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	suffix := uuid.New().String()[:8]
+	subject := "flowforge.events.testtrigger." + suffix
+	streamName := "FLOWFORGE_EVENTS_TESTTRIGGER_" + suffix
+	require.NoError(t, EnsureStream(js, streamName, subject))
+
+	tenantID := uuid.New()
+	wfID := uuid.New()
+	secret := "test-trigger-secret"
+	secretGetter := func(ctx context.Context, tid uuid.UUID) (string, error) {
+		return secret, nil
+	}
+
+	triggerer := &fakeTriggerer{}
+	subCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = SubscribeWithTriggerer(subCtx, nc, subject, "durable-trig-"+suffix, secretGetter, nil, triggerer, nil)
+	}()
+
+	pub := NewNATSPublisher(js, secretGetter)
+	err = pub.Publish(context.Background(), executor.PublishInput{
+		EventType: "workflow.trigger",
+		TenantID:  tenantID,
+		Transport: "nats",
+		Target:    subject,
+		Payload:   []byte(`{"workflowId":"` + wfID.String() + `","triggerType":"queue"}`),
+	})
+	require.NoError(t, err)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		triggerer.mu.Lock()
+		cmd := triggerer.lastCmd
+		triggerer.mu.Unlock()
+		if cmd.WorkflowID == wfID {
+			assert.Equal(t, wfID, cmd.WorkflowID)
+			assert.Equal(t, "queue", cmd.TriggerType)
+			assert.Equal(t, tenantID, cmd.TenantID)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("subscriber never triggered run for workflow")
+}
+
+// TestNATS_TriggerRun_ClampsCallerReportedTriggerType is the NATS-side
+// counterpart of TestGRPC_TriggerRun_ClampsCallerReportedTriggerType — same
+// bug class, different transport. The subscriber must force
+// triggerType="queue" regardless of what the message payload claims.
+func TestNATS_TriggerRun_ClampsCallerReportedTriggerType(t *testing.T) {
+	natsURL := "nats://localhost:4222"
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Skipf("nats not reachable: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	suffix := uuid.New().String()[:8]
+	subject := "flowforge.events.testtriggerclamp." + suffix
+	streamName := "FLOWFORGE_EVENTS_TESTTRIGGERCLAMP_" + suffix
+	require.NoError(t, EnsureStream(js, streamName, subject))
+
+	tenantID := uuid.New()
+	wfID := uuid.New()
+	secret := "test-trigger-clamp-secret"
+	secretGetter := func(ctx context.Context, tid uuid.UUID) (string, error) {
+		return secret, nil
+	}
+
+	triggerer := &fakeTriggerer{}
+	subCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = SubscribeWithTriggerer(subCtx, nc, subject, "durable-trig-clamp-"+suffix, secretGetter, nil, triggerer, nil)
+	}()
+
+	pub := NewNATSPublisher(js, secretGetter)
+	err = pub.Publish(context.Background(), executor.PublishInput{
+		EventType: "workflow.trigger",
+		TenantID:  tenantID,
+		Transport: "nats",
+		Target:    subject,
+		// The caller lies and claims "webhook" — the subscriber must ignore it.
+		Payload: []byte(`{"workflowId":"` + wfID.String() + `","triggerType":"webhook"}`),
+	})
+	require.NoError(t, err)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		triggerer.mu.Lock()
+		cmd := triggerer.lastCmd
+		triggerer.mu.Unlock()
+		if cmd.WorkflowID == wfID {
+			assert.Equal(t, wfID, cmd.WorkflowID)
+			assert.Equal(t, "queue", cmd.TriggerType, "the NATS ingress path must force triggerType=queue, never trust the caller's claim")
+			assert.Equal(t, tenantID, cmd.TenantID)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("subscriber never triggered run for workflow")
+}

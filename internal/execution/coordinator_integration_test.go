@@ -73,6 +73,82 @@ func TestCoordinator_E2EExecution(t *testing.T) {
 	for _, s := range steps {
 		assert.Equal(t, engine.StepStatusSucceeded, s.Status)
 	}
+
+	// Verify execution logs were persisted durably in Postgres for this run
+	logs, total, err := repo.ListLogs(ctx, execution.ListLogsFilter{
+		TenantID:      tenantID,
+		WorkflowRunID: run.ID,
+		Page:          1,
+		PageSize:      10,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total, "expected 2 step logs + 1 run log")
+	assert.Len(t, logs, 3)
+}
+
+// Log Writer E2E: A workflow run produces durable logs queryable via ExecutionUseCase.ListLogs.
+func TestCoordinator_E2EExecutionLogs(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	tenantID, wfID, verID, nodes := seedRunFixtures(t, ctx, pool, 2)
+	_, err := pool.Exec(ctx, `INSERT INTO workflow_edges (id, tenant_id, workflow_version_id, from_node_id, to_node_id, branch) VALUES ($1,$2,$3,$4,$5,'default')`,
+		uuid.New(), tenantID, verID, nodes[0].ID, nodes[1].ID)
+	require.NoError(t, err)
+
+	for _, n := range nodes {
+		cfg, _ := json.Marshal(map[string]any{"seconds": 0})
+		_, err := pool.Exec(ctx, `UPDATE workflow_nodes SET node_type = 'DELAY', config = $1 WHERE id = $2`, string(cfg), n.ID)
+		require.NoError(t, err)
+	}
+
+	repo := execution.NewExecutionRepository(pool)
+	run := &domain.WorkflowRun{
+		ID:                uuid.New(),
+		TenantID:          tenantID,
+		WorkflowID:        wfID,
+		WorkflowVersionID: verID,
+	}
+	_, err = repo.CreateRun(ctx, run)
+	require.NoError(t, err)
+	require.NoError(t, repo.CreateStepRuns(ctx, tenantID, run.ID, nodes))
+
+	coord := execution.NewCoordinator(repo, repo, repo, workflow.NewVersionRepository(pool),
+		executor.NewRegistry(nil, 1<<20, nil),
+		execution.CoordinatorConfig{
+			Concurrency: 4,
+			Lease:       60 * time.Second,
+			Retry:       engine.DefaultRetryPolicy(),
+			Timeout:     engine.DefaultTimeoutPolicy(),
+			WorkerID:    "it-worker",
+			Logger:      slog.New(slog.DiscardHandler),
+		})
+
+	require.NoError(t, coord.HandleRun(ctx, tenantID, run.ID))
+
+	uc := execution.NewExecutionUseCase(
+		seedWorkflowReader{get: func() (*domain.Workflow, error) { return nil, nil }},
+		repo, repo, repo, workflow.NewVersionRepository(pool), nil, nil,
+		&recordingTxRunner{}, nil, repo, execution.ExecutionConfig{},
+	)
+
+	paginated, err := uc.ListLogs(ctx, execution.ListLogsQuery{
+		TenantID: tenantID,
+		RunID:    run.ID,
+		Page:     1,
+		PageSize: 10,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), paginated.TotalItems)
+	require.Len(t, paginated.Items, 3)
+
+	messages := make([]string, len(paginated.Items))
+	for i, l := range paginated.Items {
+		messages[i] = l.Message
+	}
+	assert.Contains(t, messages, "run succeeded")
+	assert.Contains(t, messages, "step succeeded")
 }
 
 // Q-23: cancelling a run mid-flight stops dispatch of downstream steps and the

@@ -5,12 +5,15 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"flowforge/internal/domain"
 	"flowforge/internal/engine"
 	"flowforge/internal/execution"
+	"flowforge/internal/platform/metrics"
 )
 
 func newTestUseCase(t *testing.T, runs *fakeRunRepo, steps *fakeStepRepo, logs *fakeLogReader,
@@ -289,4 +292,46 @@ func TestExecutionUseCase_ListRunsParentCheck(t *testing.T) {
 	fr.mu.Lock()
 	assert.Zero(t, fr.listRunsCalls, "the run repo must not be consulted when the parent workflow is missing")
 	fr.mu.Unlock()
+}
+
+// AD-2: ExecutionUseCase records EventsPublished metric on event publication.
+func TestExecutionUseCase_PublishEvent_RecordsMetric(t *testing.T) {
+	tenantID := uuid.New()
+	wfID := uuid.New()
+	verID := uuid.New()
+
+	fr := &fakeRunRepo{}
+	fs := newFakeStepRepo([]string{"a", "b"})
+	enq := &fakeEnqueuer{}
+	audit := &fakeAuditRepo{}
+	tx := &recordingTxRunner{}
+	events := &fakeEvents{}
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
+	uc := execution.NewExecutionUseCase(
+		fakeWorkflowReader{wf: &domain.Workflow{ID: wfID, TenantID: tenantID, CurrentVersionID: &verID}},
+		fr, fs, nil, testGraph(), enq, audit, tx, nil, nil,
+		execution.ExecutionConfig{
+			AIMaxRetries:     2,
+			AIRequestTimeout: 0,
+			Events:           events,
+			Metrics:          m,
+		},
+	)
+
+	_, err := uc.CreateRun(context.Background(), execution.CreateRunCommand{
+		TenantID:   tenantID,
+		WorkflowID: wfID,
+		ActorID:    uuid.New(),
+	})
+	require.NoError(t, err)
+
+	// EventsPublished counter should increment for both workflow.run.created and workflow.run.queued
+	valCreated := testutil.ToFloat64(m.EventsPublished.WithLabelValues(tenantID.String(), domain.EventRunCreated))
+	assert.Equal(t, 1.0, valCreated, "EventsPublished must increment for workflow.run.created")
+
+	valQueued := testutil.ToFloat64(m.EventsPublished.WithLabelValues(tenantID.String(), domain.EventRunQueued))
+	assert.Equal(t, 1.0, valQueued, "EventsPublished must increment for workflow.run.queued")
 }

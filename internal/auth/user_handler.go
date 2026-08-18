@@ -44,6 +44,7 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cmd := CreateUserCommand{
+		ActorID:  authUser.ID,
 		TenantID: authUser.TenantID,
 		Email:    req.Email,
 		Password: req.Password,

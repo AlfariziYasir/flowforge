@@ -3,6 +3,7 @@ package execution
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -11,7 +12,9 @@ import (
 
 	"flowforge/internal/auth"
 	"flowforge/internal/domain"
+	"flowforge/internal/platform/eventstream"
 	"flowforge/internal/platform/httpx"
+	"flowforge/internal/platform/metrics"
 	"flowforge/internal/platform/webhookauth"
 	"flowforge/internal/workflow"
 )
@@ -19,10 +22,23 @@ import (
 // ExecutionHandler serves the run lifecycle, inspection, and analysis API.
 type ExecutionHandler struct {
 	useCase ExecutionUseCase
+	clients eventstream.ClientManager
+	metrics *metrics.Metrics
 }
 
 func NewExecutionHandler(useCase ExecutionUseCase) *ExecutionHandler {
-	return &ExecutionHandler{useCase: useCase}
+	return NewExecutionHandlerWithStream(useCase, eventstream.NewNoopClientManager(), nil)
+}
+
+func NewExecutionHandlerWithStream(useCase ExecutionUseCase, clients eventstream.ClientManager, m *metrics.Metrics) *ExecutionHandler {
+	if clients == nil {
+		clients = eventstream.NewNoopClientManager()
+	}
+	return &ExecutionHandler{
+		useCase: useCase,
+		clients: clients,
+		metrics: m,
+	}
 }
 
 type triggerRunRequest struct {
@@ -531,4 +547,71 @@ func (h *ExecutionHandler) RotateWebhookSecret(w http.ResponseWriter, r *http.Re
 		return
 	}
 	httpx.OK(w, map[string]any{"webhookSecret": secret})
+}
+
+// StreamEvents streams real-time execution events for the authenticated tenant over Server-Sent Events (SSE).
+func (h *ExecutionHandler) StreamEvents(w http.ResponseWriter, r *http.Request) {
+	authUser, ok := auth.AuthUserFromContext(r.Context())
+	if !ok {
+		httpx.Fail(w, http.StatusUnauthorized, httpx.CodeAuthUnauthorized, "authentication required")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		httpx.Fail(w, http.StatusInternalServerError, httpx.CodeInternalServerError, "streaming unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	connID, events, unregister := h.clients.Register(authUser.TenantID)
+	defer unregister()
+
+	if h.metrics != nil {
+		h.metrics.SSEConnections.WithLabelValues(authUser.TenantID.String()).Inc()
+	}
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.SSEConnections.WithLabelValues(authUser.TenantID.String()).Dec()
+		}
+	}()
+
+	// Send initial comment with connID
+	_, _ = fmt.Fprintf(w, ": connected connId=%s\n\n", connID)
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+			writeSSE(w, ev)
+			flusher.Flush()
+		case <-heartbeat.C:
+			writeSSE(w, domain.Event{
+				Type:      domain.EventHeartbeat,
+				TenantID:  authUser.TenantID,
+				Timestamp: time.Now().UTC(),
+			})
+			flusher.Flush()
+		}
+	}
+}
+
+func writeSSE(w io.Writer, ev domain.Event) {
+	if ev.ID == "" {
+		ev.ID = uuid.NewString()
+	}
+	data, _ := json.Marshal(ev)
+	_, _ = fmt.Fprintf(w, "event: %s\nid: %s\ndata: %s\n\n", ev.Type, ev.ID, string(data))
 }
